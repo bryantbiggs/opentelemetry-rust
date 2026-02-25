@@ -9,16 +9,16 @@ use core::fmt;
 #[cfg(not(target_has_atomic = "64"))]
 use portable_atomic::{AtomicI64, AtomicU64};
 use std::cmp::min;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::ops::{Add, AddAssign, Sub};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 #[cfg(target_has_atomic = "64")]
 use std::sync::atomic::{AtomicI64, AtomicU64};
-use std::sync::{Arc, OnceLock, RwLock};
+use std::sync::OnceLock;
 
 pub(crate) use aggregate::{AggregateBuilder, AggregateFns, ComputeAggregation, Measure};
 pub(crate) use exponential_histogram::{EXPO_MAX_SCALE, EXPO_MIN_SCALE};
-use opentelemetry::{otel_warn, KeyValue};
+use opentelemetry::KeyValue;
 
 use super::data::{AggregatedMetrics, MetricData};
 use super::pipeline::DEFAULT_CARDINALITY_LIMIT;
@@ -188,7 +188,7 @@ impl<A: Aggregator> ShardedMap<A> {
     }
 
     /// Look up or insert a tracker for the given attributes.
-    /// Returns true if the tracker already existed (steady-state fast path).
+    /// If cardinality limit is reached, routes measurement to the overflow bucket.
     #[inline]
     fn measure(
         &self,
@@ -197,14 +197,15 @@ impl<A: Aggregator> ShardedMap<A> {
         config: &A::InitConfig,
         count: &AtomicUsize,
         cardinality_limit: usize,
-    ) -> bool {
+        overflow_attrs: &HashedAttributes,
+    ) {
         let idx = Self::shard_index(hashed_attrs.hash);
         let mut shard = self.shards[idx].lock().unwrap_or_else(|e| e.into_inner());
 
         if let Some(entry) = shard.get(hashed_attrs) {
             entry.aggregator.update(value);
             entry.has_been_updated.store(true, Ordering::Relaxed);
-            return true;
+            return;
         }
 
         // Not found — check cardinality limit before inserting
@@ -213,10 +214,25 @@ impl<A: Aggregator> ShardedMap<A> {
             new_entry.aggregator.update(value);
             shard.insert(hashed_attrs.clone(), new_entry);
             count.fetch_add(1, Ordering::SeqCst);
-            true
+            return;
+        }
+
+        // Over cardinality limit — route to overflow bucket.
+        // Drop current shard lock first to avoid potential deadlock if overflow
+        // lands in the same shard.
+        drop(shard);
+
+        let overflow_idx = Self::shard_index(overflow_attrs.hash);
+        let mut overflow_shard = self.shards[overflow_idx]
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Some(entry) = overflow_shard.get(overflow_attrs) {
+            entry.aggregator.update(value);
+            entry.has_been_updated.store(true, Ordering::Relaxed);
         } else {
-            // Over limit — caller handles overflow
-            false
+            let entry = TrackerEntry::new(A::create(config));
+            entry.aggregator.update(value);
+            overflow_shard.insert(overflow_attrs.clone(), entry);
         }
     }
 
@@ -265,16 +281,12 @@ pub(crate) struct ValueMap<A>
 where
     A: Aggregator,
 {
-    /// Trackers store the values associated with different attribute sets.
-    trackers: RwLock<HashMap<Vec<KeyValue>, Arc<TrackerEntry<A>>>>,
-
-    /// Number of different attribute set stored in the `trackers` map.
+    trackers: ShardedMap<A>,
     count: AtomicUsize,
-    /// Indicates whether a value with no attributes has been stored.
     has_no_attribute_value: AtomicBool,
-    /// Tracker for values with no attributes attached.
     no_attribute_tracker: TrackerEntry<A>,
-    /// Configuration for an Aggregator
+    /// Pre-hashed overflow attributes — computed once at construction.
+    overflow_attrs: HashedAttributes,
     config: A::InitConfig,
     cardinality_limit: usize,
 }
@@ -288,21 +300,17 @@ where
     }
 
     fn new(config: A::InitConfig, cardinality_limit: usize) -> Self {
+        let capacity_per_shard =
+            (1 + min(DEFAULT_CARDINALITY_LIMIT, cardinality_limit)) / NUM_SHARDS + 1;
         ValueMap {
-            trackers: RwLock::new(HashMap::with_capacity(
-                1 + min(DEFAULT_CARDINALITY_LIMIT, cardinality_limit),
-            )),
+            trackers: ShardedMap::new(capacity_per_shard),
             has_no_attribute_value: AtomicBool::new(false),
             no_attribute_tracker: TrackerEntry::new(A::create(&config)),
             count: AtomicUsize::new(0),
+            overflow_attrs: HashedAttributes::from_sorted(stream_overflow_attributes().clone()),
             config,
             cardinality_limit,
         }
-    }
-
-    /// Checks whether aggregator has hit cardinality limit for metric streams
-    fn is_under_cardinality_limit(&self) -> bool {
-        self.count.load(Ordering::SeqCst) < self.cardinality_limit
     }
 
     fn measure(&self, value: A::PreComputedValue, attributes: &[KeyValue]) {
@@ -315,58 +323,17 @@ where
             return;
         }
 
-        let Ok(trackers) = self.trackers.read() else {
-            return;
-        };
+        // Hash once, sort+dedup once — this replaces the two-lookup pattern
+        let hashed = HashedAttributes::from_raw(attributes);
 
-        // Try to retrieve and update the tracker with the attributes in the provided order first
-        if let Some(tracker) = trackers.get(attributes) {
-            tracker.aggregator.update(value);
-            tracker.has_been_updated.store(true, Ordering::Relaxed);
-            return;
-        }
-
-        // Try to retrieve and update the tracker with the attributes sorted.
-        let sorted_attrs = sort_and_dedup(attributes);
-        if let Some(tracker) = trackers.get(sorted_attrs.as_slice()) {
-            tracker.aggregator.update(value);
-            tracker.has_been_updated.store(true, Ordering::Relaxed);
-            return;
-        }
-
-        // Give up the read lock before acquiring the write lock.
-        drop(trackers);
-
-        let Ok(mut trackers) = self.trackers.write() else {
-            return;
-        };
-
-        // Recheck both the provided and sorted orders after acquiring the write lock
-        // in case another thread has pushed an update in the meantime.
-        if let Some(tracker) = trackers.get(attributes) {
-            tracker.aggregator.update(value);
-            tracker.has_been_updated.store(true, Ordering::Relaxed);
-        } else if let Some(tracker) = trackers.get(sorted_attrs.as_slice()) {
-            tracker.aggregator.update(value);
-            tracker.has_been_updated.store(true, Ordering::Relaxed);
-        } else if self.is_under_cardinality_limit() {
-            let new_tracker = Arc::new(TrackerEntry::new(A::create(&self.config)));
-            new_tracker.aggregator.update(value);
-            new_tracker.has_been_updated.store(true, Ordering::Relaxed);
-
-            // Insert tracker with the attributes in the provided and sorted orders
-            trackers.insert(attributes.to_vec(), new_tracker.clone());
-            trackers.insert(sorted_attrs, new_tracker);
-
-            self.count.fetch_add(1, Ordering::SeqCst);
-        } else if let Some(overflow_value) = trackers.get(stream_overflow_attributes().as_slice()) {
-            overflow_value.aggregator.update(value);
-            overflow_value.has_been_updated.store(true, Ordering::Relaxed);
-        } else {
-            let new_tracker = TrackerEntry::new(A::create(&self.config));
-            new_tracker.aggregator.update(value);
-            trackers.insert(stream_overflow_attributes().clone(), Arc::new(new_tracker));
-        }
+        self.trackers.measure(
+            &hashed,
+            value,
+            &self.config,
+            &self.count,
+            self.cardinality_limit,
+            &self.overflow_attrs,
+        );
     }
 
     /// Iterate through all attribute sets and populate `DataPoints` in readonly mode.
@@ -381,23 +348,16 @@ where
             dest.push(map_fn(vec![], &self.no_attribute_tracker.aggregator));
         }
 
-        let Ok(trackers) = self.trackers.read() else {
-            return;
-        };
-
-        let mut seen = HashSet::new();
-        for (attrs, tracker) in trackers.iter() {
-            if seen.insert(Arc::as_ptr(tracker)) {
-                dest.push(map_fn(attrs.clone(), &tracker.aggregator));
-            }
-        }
+        self.trackers.for_each(|attrs, entry| {
+            dest.push(map_fn(attrs.attrs.clone(), &entry.aggregator));
+        });
     }
 
     /// Iterate through all attribute sets in-place, populate `DataPoints` and reset.
     /// Unlike `drain_and_reset`, this keeps entries in the map and only processes
     /// those that have been updated since the last collection (tracked via the
-    /// `has_been_updated` flag in TrackerEntry). This avoids the write lock,
-    /// heap allocations, and map rebuilding that occurs with drain-based collection.
+    /// `has_been_updated` flag in TrackerEntry). This avoids heap allocations and
+    /// map rebuilding that occurs with drain-based collection.
     ///
     /// Entries that were not updated since the last collection are evicted from the
     /// map to prevent unbounded memory growth from dynamic attribute sets.
@@ -418,42 +378,31 @@ where
             }
         }
 
-        let overflow_attrs = stream_overflow_attributes();
-        let mut stale_entries: Vec<Arc<TrackerEntry<A>>> = Vec::new();
-
-        {
-            let Ok(trackers) = self.trackers.read() else {
-                return;
-            };
-
-            let mut seen = HashSet::new();
-            for (attrs, tracker) in trackers.iter() {
-                if seen.insert(Arc::as_ptr(tracker)) {
-                    if tracker.has_been_updated.swap(false, Ordering::Relaxed) {
-                        dest.push(map_fn(attrs.clone(), &tracker.aggregator));
-                    } else if attrs.as_slice() != overflow_attrs.as_slice() {
-                        stale_entries.push(Arc::clone(tracker));
-                    }
-                }
+        // Collect updated entries and count stale ones
+        let mut has_stale = false;
+        self.trackers.for_each(|attrs, entry| {
+            if entry.has_been_updated.swap(false, Ordering::Relaxed) {
+                dest.push(map_fn(attrs.attrs.clone(), &entry.aggregator));
+            } else if *attrs != self.overflow_attrs {
+                has_stale = true;
             }
-            // Read lock released here
-        }
+        });
 
-        if !stale_entries.is_empty() {
-            if let Ok(mut trackers) = self.trackers.write() {
-                // Re-check has_been_updated under write lock to avoid TOCTOU race:
-                // a measure() call between dropping the read lock and acquiring the
-                // write lock could have updated an entry we marked as stale.
-                stale_entries.retain(|entry| !entry.has_been_updated.load(Ordering::Relaxed));
-
-                if !stale_entries.is_empty() {
-                    let stale_pointers: HashSet<*const TrackerEntry<A>> =
-                        stale_entries.iter().map(|e| Arc::as_ptr(e)).collect();
-                    trackers
-                        .retain(|_, tracker| !stale_pointers.contains(&Arc::as_ptr(tracker)));
-                    self.count
-                        .fetch_sub(stale_entries.len(), Ordering::SeqCst);
+        // Evict stale entries
+        if has_stale {
+            let mut evicted = 0usize;
+            self.trackers.retain(|attrs, entry| {
+                if entry.has_been_updated.load(Ordering::Relaxed)
+                    || *attrs == self.overflow_attrs
+                {
+                    true
+                } else {
+                    evicted += 1;
+                    false
                 }
+            });
+            if evicted > 0 {
+                self.count.fetch_sub(evicted, Ordering::SeqCst);
             }
         }
     }
@@ -475,21 +424,11 @@ where
             ));
         }
 
-        let old_trackers = {
-            let Ok(mut trackers) = self.trackers.write() else {
-                otel_warn!(name: "MeterProvider.InternalError", message = "Metric collection failed. Report this issue in OpenTelemetry repo.", details ="ValueMap trackers lock poisoned");
-                return;
-            };
-            self.count.store(0, Ordering::SeqCst);
-            std::mem::take(&mut *trackers)
-            // Write lock released here
-        };
+        let old_entries = self.trackers.drain_all();
+        self.count.store(0, Ordering::SeqCst);
 
-        let mut seen = HashSet::new();
-        for (attrs, tracker) in old_trackers {
-            if seen.insert(Arc::as_ptr(&tracker)) {
-                dest.push(map_fn(attrs, tracker.aggregator.clone_and_reset(&self.config)));
-            }
+        for (attrs, entry) in old_entries {
+            dest.push(map_fn(attrs.attrs, entry.aggregator.clone_and_reset(&self.config)));
         }
     }
 }
@@ -501,16 +440,6 @@ fn prepare_data<T>(data: &mut Vec<T>, list_len: usize) {
     if total_len > data.capacity() {
         data.reserve_exact(total_len - data.capacity());
     }
-}
-
-fn sort_and_dedup(attributes: &[KeyValue]) -> Vec<KeyValue> {
-    // Use newly allocated vec here as incoming attributes are immutable so
-    // cannot sort/de-dup in-place. TODO: This allocation can be avoided by
-    // leveraging a ThreadLocal vec.
-    let mut sorted = attributes.to_vec();
-    sorted.sort_unstable_by(|a, b| a.key.cmp(&b.key));
-    sorted.dedup_by(|a, b| a.key == b.key);
-    sorted
 }
 
 /// Marks a type that can have a value added and retrieved atomically. Required since
@@ -959,13 +888,14 @@ mod tests {
         let map = ShardedMap::<Assign<i64>>::new(16);
         let count = AtomicUsize::new(0);
         let attrs = HashedAttributes::from_raw(&[KeyValue::new("k", "v")]);
+        let overflow = HashedAttributes::from_sorted(stream_overflow_attributes().clone());
 
         // First measure creates entry
-        assert!(map.measure(&attrs, 10, &(), &count, 2000));
+        map.measure(&attrs, 10, &(), &count, 2000, &overflow);
         assert_eq!(count.load(Ordering::SeqCst), 1);
 
         // Second measure updates existing (Assign stores last value)
-        assert!(map.measure(&attrs, 42, &(), &count, 2000));
+        map.measure(&attrs, 42, &(), &count, 2000, &overflow);
         assert_eq!(count.load(Ordering::SeqCst), 1);
 
         // Verify last value via iteration
@@ -980,29 +910,41 @@ mod tests {
     fn sharded_map_cardinality_limit() {
         let map = ShardedMap::<Assign<i64>>::new(4);
         let count = AtomicUsize::new(0);
+        let overflow = HashedAttributes::from_sorted(stream_overflow_attributes().clone());
 
         // Insert up to limit
         for i in 0..3 {
             let attrs = HashedAttributes::from_raw(&[KeyValue::new("k", i.to_string())]);
-            assert!(map.measure(&attrs, 1, &(), &count, 3));
+            map.measure(&attrs, 1, &(), &count, 3, &overflow);
         }
         assert_eq!(count.load(Ordering::SeqCst), 3);
 
-        // Next insert should fail (at limit)
-        let attrs = HashedAttributes::from_raw(&[KeyValue::new("k", "overflow")]);
-        assert!(!map.measure(&attrs, 1, &(), &count, 3));
+        // Next insert should go to overflow bucket
+        let attrs = HashedAttributes::from_raw(&[KeyValue::new("k", "new")]);
+        map.measure(&attrs, 99, &(), &count, 3, &overflow);
+        // Count should still be 3 (overflow doesn't increment count)
         assert_eq!(count.load(Ordering::SeqCst), 3);
+
+        // Verify overflow bucket got the value
+        let mut overflow_val = 0i64;
+        map.for_each(|attrs, entry| {
+            if *attrs == overflow {
+                overflow_val = entry.aggregator.value.get_value();
+            }
+        });
+        assert_eq!(overflow_val, 99);
     }
 
     #[test]
     fn sharded_map_retain_evicts_entries() {
         let map = ShardedMap::<Assign<i64>>::new(4);
         let count = AtomicUsize::new(0);
+        let overflow = HashedAttributes::from_sorted(stream_overflow_attributes().clone());
 
         let a1 = HashedAttributes::from_raw(&[KeyValue::new("k", "keep")]);
         let a2 = HashedAttributes::from_raw(&[KeyValue::new("k", "evict")]);
-        map.measure(&a1, 1, &(), &count, 2000);
-        map.measure(&a2, 1, &(), &count, 2000);
+        map.measure(&a1, 1, &(), &count, 2000, &overflow);
+        map.measure(&a2, 1, &(), &count, 2000, &overflow);
 
         // Mark a2 as not updated (simulating stale)
         map.for_each(|attrs, entry| {
