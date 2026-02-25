@@ -31,6 +31,92 @@ fn stream_overflow_attributes() -> &'static Vec<KeyValue> {
     STREAM_OVERFLOW_ATTRIBUTES.get_or_init(|| vec![KeyValue::new("otel.metric.overflow", true)])
 }
 
+use core::hash::{BuildHasher, Hasher};
+
+/// Pre-computed hash of a sorted+deduped attribute set.
+/// The hash is computed once via foldhash when the attributes are first seen,
+/// then carried through all subsequent lookups via PassthroughHasher.
+#[derive(Clone, Debug)]
+struct HashedAttributes {
+    /// Sorted, deduplicated attributes (canonical form).
+    attrs: Vec<KeyValue>,
+    /// Pre-computed foldhash of the canonical attributes.
+    hash: u64,
+}
+
+impl HashedAttributes {
+    /// Create from raw attributes: sort, dedup, hash once.
+    fn from_raw(attributes: &[KeyValue]) -> Self {
+        let mut sorted = attributes.to_vec();
+        sorted.sort_unstable_by(|a, b| a.key.cmp(&b.key));
+        sorted.dedup_by(|a, b| a.key == b.key);
+        let hash = Self::compute_hash(&sorted);
+        HashedAttributes {
+            attrs: sorted,
+            hash,
+        }
+    }
+
+    /// Create from already-sorted attributes (e.g., overflow sentinel).
+    fn from_sorted(attrs: Vec<KeyValue>) -> Self {
+        let hash = Self::compute_hash(&attrs);
+        HashedAttributes { attrs, hash }
+    }
+
+    fn compute_hash(attrs: &[KeyValue]) -> u64 {
+        use std::hash::Hash;
+        let state = foldhash::fast::FixedState::with_seed(0);
+        let mut hasher = state.build_hasher();
+        attrs.hash(&mut hasher);
+        hasher.finish()
+    }
+}
+
+impl PartialEq for HashedAttributes {
+    fn eq(&self, other: &Self) -> bool {
+        self.hash == other.hash && self.attrs == other.attrs
+    }
+}
+
+impl Eq for HashedAttributes {}
+
+impl std::hash::Hash for HashedAttributes {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        // Write pre-computed hash directly — PassthroughHasher will use this
+        state.write_u64(self.hash);
+    }
+}
+
+/// A hasher that returns the pre-computed hash value directly.
+/// Used with HashedAttributes to avoid re-hashing inside HashMap.
+struct PassthroughHasher(u64);
+
+impl Hasher for PassthroughHasher {
+    fn write(&mut self, _bytes: &[u8]) {
+        // Should not be called — HashedAttributes::hash writes u64 directly
+        unreachable!("PassthroughHasher only supports write_u64");
+    }
+
+    fn write_u64(&mut self, i: u64) {
+        self.0 = i;
+    }
+
+    fn finish(&self) -> u64 {
+        self.0
+    }
+}
+
+#[derive(Clone, Default)]
+struct PassthroughBuildHasher;
+
+impl BuildHasher for PassthroughBuildHasher {
+    type Hasher = PassthroughHasher;
+
+    fn build_hasher(&self) -> PassthroughHasher {
+        PassthroughHasher(0)
+    }
+}
+
 pub(crate) trait Aggregator {
     /// A static configuration that is needed in order to initialize aggregator.
     /// E.g. bucket_size at creation time .
@@ -726,5 +812,44 @@ mod tests {
 
         // Should not panic
         let _value_map = ValueMap::<Assign<i64>>::new((), usize::MAX);
+    }
+
+    #[test]
+    fn hashed_attributes_equal_regardless_of_input_order() {
+        let a = HashedAttributes::from_raw(&[
+            KeyValue::new("z", "1"),
+            KeyValue::new("a", "2"),
+        ]);
+        let b = HashedAttributes::from_raw(&[
+            KeyValue::new("a", "2"),
+            KeyValue::new("z", "1"),
+        ]);
+        assert_eq!(a, b);
+        assert_eq!(a.hash, b.hash);
+    }
+
+    #[test]
+    fn hashed_attributes_dedup_keys() {
+        let a = HashedAttributes::from_raw(&[
+            KeyValue::new("k", "first"),
+            KeyValue::new("k", "second"),
+        ]);
+        assert_eq!(a.attrs.len(), 1);
+    }
+
+    #[test]
+    fn hashed_attributes_different_values_differ() {
+        let a = HashedAttributes::from_raw(&[KeyValue::new("k", "v1")]);
+        let b = HashedAttributes::from_raw(&[KeyValue::new("k", "v2")]);
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn passthrough_hasher_returns_precomputed_hash() {
+        use std::hash::Hash;
+        let ha = HashedAttributes::from_raw(&[KeyValue::new("test", "val")]);
+        let mut hasher = PassthroughHasher(0);
+        ha.hash(&mut hasher);
+        assert_eq!(hasher.finish(), ha.hash);
     }
 }
