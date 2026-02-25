@@ -9,7 +9,7 @@ use crate::{
 };
 use std::sync::Arc;
 
-use super::instruments::SyncInstrument;
+use super::instruments::{BoundSyncInstrument, SyncInstrument};
 
 /// A no-op instance of a `MetricProvider`
 #[derive(Debug, Default)]
@@ -59,8 +59,22 @@ impl NoopSyncInstrument {
     }
 }
 
-impl<T> SyncInstrument<T> for NoopSyncInstrument {
+impl<T: Send + Sync + 'static> SyncInstrument<T> for NoopSyncInstrument {
     fn measure(&self, _value: T, _attributes: &[KeyValue]) {
+        // Ignored
+    }
+
+    fn bind(&self, _attributes: &[KeyValue]) -> Box<dyn BoundSyncInstrument<T>> {
+        Box::new(NoopBoundSyncInstrument { _private: () })
+    }
+}
+
+struct NoopBoundSyncInstrument {
+    _private: (),
+}
+
+impl<T> BoundSyncInstrument<T> for NoopBoundSyncInstrument {
+    fn measure(&self, _measurement: T) {
         // Ignored
     }
 }

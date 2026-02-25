@@ -2,7 +2,7 @@ use crate::KeyValue;
 use core::fmt;
 use std::sync::Arc;
 
-use super::SyncInstrument;
+use super::{BoundSyncInstrument, SyncInstrument};
 
 /// An instrument that records increasing values.
 ///
@@ -31,6 +31,30 @@ impl<T> Counter<T> {
     /// Records an increment to the counter.
     pub fn add(&self, value: T, attributes: &[KeyValue]) {
         self.0.measure(value, attributes)
+    }
+
+    /// Returns a pre-bound counter that records increments without attributes.
+    pub fn bind(&self, attributes: &[KeyValue]) -> BoundCounter<T> {
+        BoundCounter(self.0.bind(attributes))
+    }
+}
+
+/// A pre-bound counter that records increments without specifying attributes.
+pub struct BoundCounter<T>(Box<dyn BoundSyncInstrument<T> + Send + Sync>);
+
+impl<T> fmt::Debug for BoundCounter<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_fmt(format_args!(
+            "BoundCounter<{}>",
+            std::any::type_name::<T>()
+        ))
+    }
+}
+
+impl<T> BoundCounter<T> {
+    /// Records an increment to the counter.
+    pub fn add(&self, value: T) {
+        self.0.measure(value)
     }
 }
 

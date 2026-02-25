@@ -1,7 +1,7 @@
 use std::{borrow::Cow, collections::HashSet, error::Error, sync::Arc};
 
 use opentelemetry::{
-    metrics::{AsyncInstrument, SyncInstrument},
+    metrics::{AsyncInstrument, BoundSyncInstrument, SyncInstrument},
     InstrumentationScope, Key, KeyValue,
 };
 
@@ -382,10 +382,30 @@ pub(crate) struct ResolvedMeasures<T> {
     pub(crate) measures: Vec<Arc<dyn Measure<T>>>,
 }
 
-impl<T: Copy + 'static> SyncInstrument<T> for ResolvedMeasures<T> {
+impl<T: Copy + Send + Sync + 'static> SyncInstrument<T> for ResolvedMeasures<T> {
     fn measure(&self, val: T, attrs: &[KeyValue]) {
         for measure in &self.measures {
             measure.call(val, attrs)
+        }
+    }
+
+    fn bind(&self, attrs: &[KeyValue]) -> Box<dyn BoundSyncInstrument<T>> {
+        Box::new(NaiveBoundMeasures {
+            measures: self.measures.clone(),
+            attrs: attrs.to_vec(),
+        })
+    }
+}
+
+struct NaiveBoundMeasures<T> {
+    measures: Vec<Arc<dyn Measure<T>>>,
+    attrs: Vec<KeyValue>,
+}
+
+impl<T: Copy + Send + Sync + 'static> BoundSyncInstrument<T> for NaiveBoundMeasures<T> {
+    fn measure(&self, val: T) {
+        for measure in &self.measures {
+            measure.call(val, &self.attrs);
         }
     }
 }

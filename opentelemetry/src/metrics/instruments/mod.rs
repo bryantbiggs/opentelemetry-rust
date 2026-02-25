@@ -28,6 +28,15 @@ pub trait AsyncInstrument<T>: Send + Sync {
 pub trait SyncInstrument<T>: Send + Sync {
     /// Records a measurement synchronously.
     fn measure(&self, measurement: T, attributes: &[KeyValue]);
+
+    /// Returns a pre-bound instrument that records measurements without attributes.
+    fn bind(&self, attributes: &[KeyValue]) -> Box<dyn BoundSyncInstrument<T>>;
+}
+
+/// A pre-bound synchronous instrument that records measurements without attributes.
+pub trait BoundSyncInstrument<T>: Send + Sync {
+    /// Records a measurement.
+    fn measure(&self, measurement: T);
 }
 
 /// Configuration for building a Histogram.
