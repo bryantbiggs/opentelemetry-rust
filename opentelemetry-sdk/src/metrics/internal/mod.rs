@@ -155,6 +155,108 @@ impl<A: Aggregator> TrackerEntry<A> {
     }
 }
 
+use std::sync::Mutex;
+
+/// Number of shards — must be a power of two for fast modulo via bitmask.
+const NUM_SHARDS: usize = 16;
+
+type ShardHashMap<A> = HashMap<HashedAttributes, TrackerEntry<A>, PassthroughBuildHasher>;
+
+/// A sharded concurrent map for attribute-to-tracker lookup.
+/// Each shard is independently locked, reducing contention on measure() from
+/// N threads competing for one RwLock to N/NUM_SHARDS threads per Mutex.
+struct ShardedMap<A: Aggregator> {
+    shards: Box<[Mutex<ShardHashMap<A>>; NUM_SHARDS]>,
+}
+
+impl<A: Aggregator> ShardedMap<A> {
+    fn new(capacity_per_shard: usize) -> Self {
+        ShardedMap {
+            shards: Box::new(std::array::from_fn(|_| {
+                Mutex::new(HashMap::with_capacity_and_hasher(
+                    capacity_per_shard,
+                    PassthroughBuildHasher,
+                ))
+            })),
+        }
+    }
+
+    /// Select shard using the pre-computed hash.
+    #[inline]
+    fn shard_index(hash: u64) -> usize {
+        (hash as usize) & (NUM_SHARDS - 1)
+    }
+
+    /// Look up or insert a tracker for the given attributes.
+    /// Returns true if the tracker already existed (steady-state fast path).
+    #[inline]
+    fn measure(
+        &self,
+        hashed_attrs: &HashedAttributes,
+        value: A::PreComputedValue,
+        config: &A::InitConfig,
+        count: &AtomicUsize,
+        cardinality_limit: usize,
+    ) -> bool {
+        let idx = Self::shard_index(hashed_attrs.hash);
+        let mut shard = self.shards[idx].lock().unwrap_or_else(|e| e.into_inner());
+
+        if let Some(entry) = shard.get(hashed_attrs) {
+            entry.aggregator.update(value);
+            entry.has_been_updated.store(true, Ordering::Relaxed);
+            return true;
+        }
+
+        // Not found — check cardinality limit before inserting
+        if count.load(Ordering::SeqCst) < cardinality_limit {
+            let new_entry = TrackerEntry::new(A::create(config));
+            new_entry.aggregator.update(value);
+            shard.insert(hashed_attrs.clone(), new_entry);
+            count.fetch_add(1, Ordering::SeqCst);
+            true
+        } else {
+            // Over limit — caller handles overflow
+            false
+        }
+    }
+
+    /// Iterate all shards, calling `f` for each entry.
+    /// Locks one shard at a time to minimize contention with measure().
+    fn for_each<F>(&self, mut f: F)
+    where
+        F: FnMut(&HashedAttributes, &TrackerEntry<A>),
+    {
+        for shard in self.shards.iter() {
+            let shard = shard.lock().unwrap_or_else(|e| e.into_inner());
+            for (attrs, entry) in shard.iter() {
+                f(attrs, entry);
+            }
+        }
+    }
+
+    /// Iterate all shards, retaining only entries where `f` returns true.
+    /// Used for stale entry eviction in delta collect.
+    fn retain<F>(&self, mut f: F)
+    where
+        F: FnMut(&HashedAttributes, &TrackerEntry<A>) -> bool,
+    {
+        for shard in self.shards.iter() {
+            let mut shard = shard.lock().unwrap_or_else(|e| e.into_inner());
+            shard.retain(|attrs, entry| f(attrs, entry));
+        }
+    }
+
+    /// Drain all shards, returning all entries. Used by drain_and_reset.
+    fn drain_all(&self) -> Vec<(HashedAttributes, TrackerEntry<A>)> {
+        let mut result = Vec::new();
+        for shard in self.shards.iter() {
+            let mut shard = shard.lock().unwrap_or_else(|e| e.into_inner());
+            result.extend(shard.drain());
+        }
+        result
+    }
+}
+
 /// The storage for sums.
 ///
 /// This structure is parametrized by an `Operation` that indicates how
@@ -681,7 +783,6 @@ impl AtomicallyUpdate<f64> for f64 {
 #[cfg(test)]
 mod tests {
     use crate::metrics::internal::last_value::Assign;
-
     use super::*;
 
     // Test helpers that return boxed trait objects to avoid method shadowing
@@ -851,5 +952,71 @@ mod tests {
         let mut hasher = PassthroughHasher(0);
         ha.hash(&mut hasher);
         assert_eq!(hasher.finish(), ha.hash);
+    }
+
+    #[test]
+    fn sharded_map_measure_and_iterate() {
+        let map = ShardedMap::<Assign<i64>>::new(16);
+        let count = AtomicUsize::new(0);
+        let attrs = HashedAttributes::from_raw(&[KeyValue::new("k", "v")]);
+
+        // First measure creates entry
+        assert!(map.measure(&attrs, 10, &(), &count, 2000));
+        assert_eq!(count.load(Ordering::SeqCst), 1);
+
+        // Second measure updates existing (Assign stores last value)
+        assert!(map.measure(&attrs, 42, &(), &count, 2000));
+        assert_eq!(count.load(Ordering::SeqCst), 1);
+
+        // Verify last value via iteration
+        let mut val = 0i64;
+        map.for_each(|_, entry| {
+            val = entry.aggregator.value.get_value();
+        });
+        assert_eq!(val, 42);
+    }
+
+    #[test]
+    fn sharded_map_cardinality_limit() {
+        let map = ShardedMap::<Assign<i64>>::new(4);
+        let count = AtomicUsize::new(0);
+
+        // Insert up to limit
+        for i in 0..3 {
+            let attrs = HashedAttributes::from_raw(&[KeyValue::new("k", i.to_string())]);
+            assert!(map.measure(&attrs, 1, &(), &count, 3));
+        }
+        assert_eq!(count.load(Ordering::SeqCst), 3);
+
+        // Next insert should fail (at limit)
+        let attrs = HashedAttributes::from_raw(&[KeyValue::new("k", "overflow")]);
+        assert!(!map.measure(&attrs, 1, &(), &count, 3));
+        assert_eq!(count.load(Ordering::SeqCst), 3);
+    }
+
+    #[test]
+    fn sharded_map_retain_evicts_entries() {
+        let map = ShardedMap::<Assign<i64>>::new(4);
+        let count = AtomicUsize::new(0);
+
+        let a1 = HashedAttributes::from_raw(&[KeyValue::new("k", "keep")]);
+        let a2 = HashedAttributes::from_raw(&[KeyValue::new("k", "evict")]);
+        map.measure(&a1, 1, &(), &count, 2000);
+        map.measure(&a2, 1, &(), &count, 2000);
+
+        // Mark a2 as not updated (simulating stale)
+        map.for_each(|attrs, entry| {
+            if attrs.attrs[0].key.as_str() == "k"
+                && format!("{}", attrs.attrs[0].value) == "evict"
+            {
+                entry.has_been_updated.store(false, Ordering::Relaxed);
+            }
+        });
+
+        map.retain(|_, entry| entry.has_been_updated.load(Ordering::Relaxed));
+
+        let mut remaining = 0;
+        map.for_each(|_, _| remaining += 1);
+        assert_eq!(remaining, 1);
     }
 }
