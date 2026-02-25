@@ -1,5 +1,5 @@
 use opentelemetry::{
-    metrics::{InstrumentProvider, SyncInstrument},
+    metrics::{BoundSyncInstrument, InstrumentProvider, SyncInstrument},
     KeyValue,
 };
 
@@ -31,8 +31,18 @@ impl NoopSyncInstrument {
     }
 }
 
-impl<T> SyncInstrument<T> for NoopSyncInstrument {
+struct NoopBoundSyncInstrument;
+
+impl<T> BoundSyncInstrument<T> for NoopBoundSyncInstrument {
+    fn measure(&self, _measurement: T) {}
+}
+
+impl<T: 'static> SyncInstrument<T> for NoopSyncInstrument {
     fn measure(&self, _value: T, _attributes: &[KeyValue]) {
         // Ignored
+    }
+
+    fn bind(&self, _attributes: &[KeyValue]) -> Box<dyn BoundSyncInstrument<T>> {
+        Box::new(NoopBoundSyncInstrument)
     }
 }

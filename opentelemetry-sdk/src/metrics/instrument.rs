@@ -1,11 +1,14 @@
 use std::{borrow::Cow, collections::HashSet, error::Error, sync::Arc};
 
 use opentelemetry::{
-    metrics::{AsyncInstrument, SyncInstrument},
+    metrics::{AsyncInstrument, BoundSyncInstrument, SyncInstrument},
     InstrumentationScope, Key, KeyValue,
 };
 
-use crate::metrics::{aggregation::Aggregation, internal::Measure};
+use crate::metrics::{
+    aggregation::Aggregation,
+    internal::{BoundMeasure, Measure},
+};
 
 use super::meter::{
     INSTRUMENT_NAME_EMPTY, INSTRUMENT_NAME_FIRST_ALPHABETIC, INSTRUMENT_NAME_INVALID_CHAR,
@@ -382,11 +385,33 @@ pub(crate) struct ResolvedMeasures<T> {
     pub(crate) measures: Vec<Arc<dyn Measure<T>>>,
 }
 
+/// Wraps multiple BoundMeasure handles (one per pipeline) into a single BoundSyncInstrument.
+struct ResolvedBoundMeasures<T> {
+    handles: Vec<Box<dyn BoundMeasure<T>>>,
+}
+
+impl<T: Copy + 'static> BoundSyncInstrument<T> for ResolvedBoundMeasures<T> {
+    fn measure(&self, val: T) {
+        for handle in &self.handles {
+            handle.call(val);
+        }
+    }
+}
+
 impl<T: Copy + 'static> SyncInstrument<T> for ResolvedMeasures<T> {
     fn measure(&self, val: T, attrs: &[KeyValue]) {
         for measure in &self.measures {
             measure.call(val, attrs)
         }
+    }
+
+    fn bind(&self, attrs: &[KeyValue]) -> Box<dyn BoundSyncInstrument<T>> {
+        let handles: Vec<Box<dyn BoundMeasure<T>>> = self
+            .measures
+            .iter()
+            .map(|m| m.bind(attrs, Arc::clone(m)))
+            .collect();
+        Box::new(ResolvedBoundMeasures { handles })
     }
 }
 

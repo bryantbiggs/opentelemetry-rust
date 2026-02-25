@@ -24,10 +24,22 @@ pub trait AsyncInstrument<T>: Send + Sync {
     fn observe(&self, measurement: T, attributes: &[KeyValue]);
 }
 
+/// A pre-bound instrument handle that records measurements without per-call attribute lookup.
+///
+/// Created by [`SyncInstrument::bind`]. The handle caches a direct reference to the
+/// underlying aggregator, bypassing the sort→hash→lock→lookup path on every call.
+pub trait BoundSyncInstrument<T>: Send + Sync {
+    /// Records a measurement using the pre-bound attributes.
+    fn measure(&self, measurement: T);
+}
+
 /// An SDK implemented instrument that records measurements synchronously.
 pub trait SyncInstrument<T>: Send + Sync {
     /// Records a measurement synchronously.
     fn measure(&self, measurement: T, attributes: &[KeyValue]);
+
+    /// Create a pre-bound handle for the given attribute set.
+    fn bind(&self, attributes: &[KeyValue]) -> Box<dyn BoundSyncInstrument<T>>;
 }
 
 /// Configuration for building a Histogram.
