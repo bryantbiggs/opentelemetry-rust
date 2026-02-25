@@ -443,33 +443,35 @@ where
             }
         }
 
-        // Collect updated entries and count stale ones
-        let mut has_stale = false;
+        // Collect updated entries
         self.trackers.for_each(|attrs, entry| {
             if entry.has_been_updated.swap(false, Ordering::Relaxed) {
                 dest.push(map_fn(attrs.attrs.clone(), &entry.aggregator));
-            } else if *attrs != self.overflow_attrs {
-                has_stale = true;
             }
         });
 
-        // Evict stale entries
-        if has_stale {
-            let mut evicted = 0usize;
-            self.trackers.retain(|attrs, entry| {
-                if entry.has_been_updated.load(Ordering::Relaxed)
-                    || *attrs == self.overflow_attrs
-                {
-                    true
-                } else {
-                    entry.evicted.store(true, Ordering::Release);
+        // Evict all non-updated entries. This includes both:
+        // - Entries just collected above (has_been_updated swapped from true to false)
+        // - Entries stale from previous cycles (already false)
+        // This mirrors main's swap-and-drain: after delta collection, entries are
+        // removed so the cardinality count is freed for new attribute sets.
+        // Entries updated concurrently by measure() between for_each and retain
+        // will have has_been_updated=true and are correctly kept.
+        let mut evicted = 0usize;
+        self.trackers.retain(|attrs, entry| {
+            if entry.has_been_updated.load(Ordering::Relaxed) {
+                true
+            } else {
+                entry.evicted.store(true, Ordering::Release);
+                // Overflow entries are not counted in `count`
+                if *attrs != self.overflow_attrs {
                     evicted += 1;
-                    false
                 }
-            });
-            if evicted > 0 {
-                self.count.fetch_sub(evicted, Ordering::SeqCst);
+                false
             }
+        });
+        if evicted > 0 {
+            self.count.fetch_sub(evicted, Ordering::SeqCst);
         }
     }
 
