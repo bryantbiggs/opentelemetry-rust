@@ -211,6 +211,9 @@ where
     /// `has_been_updated` flag in TrackerEntry). This avoids the write lock,
     /// heap allocations, and map rebuilding that occurs with drain-based collection.
     ///
+    /// Entries that were not updated since the last collection are evicted from the
+    /// map to prevent unbounded memory growth from dynamic attribute sets.
+    ///
     /// Used for synchronous instruments (Counter, Gauge) in Delta temporality mode.
     pub(crate) fn collect_and_reset<Res, MapFn>(&self, dest: &mut Vec<Res>, mut map_fn: MapFn)
     where
@@ -227,15 +230,41 @@ where
             }
         }
 
-        let Ok(trackers) = self.trackers.read() else {
-            return;
-        };
+        let overflow_attrs = stream_overflow_attributes();
+        let mut stale_entries: Vec<Arc<TrackerEntry<A>>> = Vec::new();
 
-        let mut seen = HashSet::new();
-        for (attrs, tracker) in trackers.iter() {
-            if seen.insert(Arc::as_ptr(tracker)) {
-                if tracker.has_been_updated.swap(false, Ordering::AcqRel) {
-                    dest.push(map_fn(attrs.clone(), &tracker.aggregator));
+        {
+            let Ok(trackers) = self.trackers.read() else {
+                return;
+            };
+
+            let mut seen = HashSet::new();
+            for (attrs, tracker) in trackers.iter() {
+                if seen.insert(Arc::as_ptr(tracker)) {
+                    if tracker.has_been_updated.swap(false, Ordering::AcqRel) {
+                        dest.push(map_fn(attrs.clone(), &tracker.aggregator));
+                    } else if attrs.as_slice() != overflow_attrs.as_slice() {
+                        stale_entries.push(Arc::clone(tracker));
+                    }
+                }
+            }
+            // Read lock released here
+        }
+
+        if !stale_entries.is_empty() {
+            if let Ok(mut trackers) = self.trackers.write() {
+                // Re-check has_been_updated under write lock to avoid TOCTOU race:
+                // a measure() call between dropping the read lock and acquiring the
+                // write lock could have updated an entry we marked as stale.
+                stale_entries.retain(|entry| !entry.has_been_updated.load(Ordering::Acquire));
+
+                if !stale_entries.is_empty() {
+                    let stale_pointers: HashSet<*const TrackerEntry<A>> =
+                        stale_entries.iter().map(|e| Arc::as_ptr(e)).collect();
+                    trackers
+                        .retain(|_, tracker| !stale_pointers.contains(&Arc::as_ptr(tracker)));
+                    self.count
+                        .fetch_sub(stale_entries.len(), Ordering::SeqCst);
                 }
             }
         }
