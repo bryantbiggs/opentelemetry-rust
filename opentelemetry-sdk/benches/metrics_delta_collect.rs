@@ -569,46 +569,49 @@ fn bench_multithread_measure_after_collect(c: &mut Criterion) {
     group.measurement_time(Duration::from_secs(5));
     group.sample_size(20);
 
-    let num_worker_threads = 4;
-    let measures_per_worker = 2500;
+    let total_measures = 10_000;
 
-    for temporality in [Temporality::Cumulative, Temporality::Delta] {
-        let label = match temporality {
-            Temporality::Delta => "Delta",
-            _ => "Cumulative",
-        };
+    for num_worker_threads in [4, 8, 12] {
+        let measures_per_worker = total_measures / num_worker_threads;
 
-        let (rdr, counter) = setup_counter(temporality);
-        let mut rm = ResourceMetrics::default();
-        hydrate_counter(&counter);
+        for temporality in [Temporality::Cumulative, Temporality::Delta] {
+            let label = match temporality {
+                Temporality::Delta => "Delta",
+                _ => "Cumulative",
+            };
 
-        group.throughput(Throughput::Elements(
-            (num_worker_threads * measures_per_worker) as u64,
-        ));
-        group.bench_function(
-            BenchmarkId::new(format!("{num_worker_threads}threads_counter"), label),
-            |b| {
-                b.iter_batched(
-                    || {
-                        let _ = rdr.collect(&mut rm);
-                    },
-                    |_| {
-                        std::thread::scope(|s| {
-                            for _ in 0..num_worker_threads {
-                                let counter_ref = &counter;
-                                s.spawn(move || {
-                                    for _ in 0..measures_per_worker {
-                                        let attrs = random_attrs_3();
-                                        counter_ref.add(1, &attrs);
-                                    }
-                                });
-                            }
-                        });
-                    },
-                    BatchSize::LargeInput,
-                );
-            },
-        );
+            let (rdr, counter) = setup_counter(temporality);
+            let mut rm = ResourceMetrics::default();
+            hydrate_counter(&counter);
+
+            group.throughput(Throughput::Elements(
+                (num_worker_threads * measures_per_worker) as u64,
+            ));
+            group.bench_function(
+                BenchmarkId::new(format!("{num_worker_threads}threads_counter"), label),
+                |b| {
+                    b.iter_batched(
+                        || {
+                            let _ = rdr.collect(&mut rm);
+                        },
+                        |_| {
+                            std::thread::scope(|s| {
+                                for _ in 0..num_worker_threads {
+                                    let counter_ref = &counter;
+                                    s.spawn(move || {
+                                        for _ in 0..measures_per_worker {
+                                            let attrs = random_attrs_3();
+                                            counter_ref.add(1, &attrs);
+                                        }
+                                    });
+                                }
+                            });
+                        },
+                        BatchSize::LargeInput,
+                    );
+                },
+            );
+        }
     }
     group.finish();
 }
