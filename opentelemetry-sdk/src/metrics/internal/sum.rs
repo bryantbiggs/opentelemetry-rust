@@ -2,9 +2,12 @@ use crate::metrics::data::{self, AggregatedMetrics, MetricData, SumDataPoint};
 use crate::metrics::Temporality;
 use opentelemetry::KeyValue;
 
+use std::sync::Arc;
+use std::sync::atomic::Ordering;
+
 use super::aggregate::{AggregateTimeInitiator, AttributeSetFilter};
-use super::{Aggregator, AtomicTracker, ComputeAggregation, Measure, Number};
-use super::{AtomicallyUpdate, ValueMap};
+use super::{Aggregator, AtomicTracker, BoundMeasure, ComputeAggregation, Measure, Number};
+use super::{AtomicallyUpdate, TrackerEntry, ValueMap};
 
 struct Increment<T>
 where
@@ -144,6 +147,24 @@ impl<T: Number> Sum<T> {
     }
 }
 
+struct BoundSumHandle<T: Number> {
+    entry: Arc<TrackerEntry<Increment<T>>>,
+    fallback: Arc<dyn Measure<T>>,
+    attrs: Vec<KeyValue>,
+}
+
+impl<T: Number> BoundMeasure<T> for BoundSumHandle<T> {
+    fn call(&self, value: T) {
+        if self.entry.evicted.load(Ordering::Acquire) {
+            // Poisoned — fall back to unbound path
+            self.fallback.call(value, &self.attrs);
+            return;
+        }
+        self.entry.aggregator.update(value);
+        self.entry.has_been_updated.store(true, Ordering::Relaxed);
+    }
+}
+
 impl<T> Measure<T> for Sum<T>
 where
     T: Number,
@@ -151,6 +172,23 @@ where
     fn call(&self, measurement: T, attrs: &[KeyValue]) {
         self.filter.apply(attrs, |filtered| {
             self.value_map.measure(measurement, filtered);
+        })
+    }
+
+    fn bind(
+        &self,
+        attrs: &[KeyValue],
+        self_arc: Arc<dyn Measure<T>>,
+    ) -> Box<dyn BoundMeasure<T>> {
+        let filtered: Vec<KeyValue> = match &self.filter.filter {
+            Some(filter) => attrs.iter().filter(|kv| filter(kv)).cloned().collect(),
+            None => attrs.to_vec(),
+        };
+        let entry = self.value_map.bind(&filtered);
+        Box::new(BoundSumHandle {
+            entry,
+            fallback: self_arc,
+            attrs: filtered,
         })
     }
 }

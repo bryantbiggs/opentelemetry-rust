@@ -8,9 +8,11 @@ use crate::metrics::{
     Temporality,
 };
 
+use std::sync::Arc;
+
 use super::{
     aggregate::{AggregateTimeInitiator, AttributeSetFilter},
-    Aggregator, ComputeAggregation, Measure, Number, ValueMap,
+    Aggregator, BoundMeasure, ComputeAggregation, Measure, Number, ValueMap,
 };
 
 pub(crate) const EXPO_MAX_SCALE: i8 = 20;
@@ -524,6 +526,14 @@ where
         self.filter.apply(attrs, |filtered| {
             self.value_map.measure(measurement, filtered);
         })
+    }
+
+    fn bind(
+        &self,
+        _attrs: &[KeyValue],
+        _self_arc: Arc<dyn Measure<T>>,
+    ) -> Box<dyn BoundMeasure<T>> {
+        unimplemented!("bind() not supported for ExpoHistogram in PoC")
     }
 }
 

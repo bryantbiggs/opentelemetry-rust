@@ -5,8 +5,8 @@ use crate::metrics::Temporality;
 
 use super::aggregate::{AggregateTimeInitiator, AttributeSetFilter};
 use super::{last_value::Assign, AtomicTracker, Number, ValueMap};
-use super::{ComputeAggregation, Measure};
-use std::{collections::HashMap, sync::Mutex};
+use super::{BoundMeasure, ComputeAggregation, Measure};
+use std::{collections::HashMap, sync::{Arc, Mutex}};
 
 /// Summarizes a set of pre-computed sums as their arithmetic sum.
 pub(crate) struct PrecomputedSum<T: Number> {
@@ -137,6 +137,14 @@ where
         self.filter.apply(attrs, |filtered| {
             self.value_map.measure(measurement, filtered);
         })
+    }
+
+    fn bind(
+        &self,
+        _attrs: &[KeyValue],
+        _self_arc: Arc<dyn Measure<T>>,
+    ) -> Box<dyn BoundMeasure<T>> {
+        unimplemented!("bind() not supported for PrecomputedSum in PoC")
     }
 }
 

@@ -16,7 +16,9 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::atomic::{AtomicI64, AtomicU64};
 use std::sync::OnceLock;
 
-pub(crate) use aggregate::{AggregateBuilder, AggregateFns, ComputeAggregation, Measure};
+pub(crate) use aggregate::{
+    AggregateBuilder, AggregateFns, BoundMeasure, ComputeAggregation, Measure,
+};
 pub(crate) use exponential_histogram::{EXPO_MAX_SCALE, EXPO_MIN_SCALE};
 use opentelemetry::KeyValue;
 

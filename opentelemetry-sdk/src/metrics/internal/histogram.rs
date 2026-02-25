@@ -7,10 +7,11 @@ use crate::metrics::data::{AggregatedMetrics, HistogramDataPoint};
 use crate::metrics::Temporality;
 use opentelemetry::KeyValue;
 
+use std::sync::Arc;
+
 use super::aggregate::AggregateTimeInitiator;
 use super::aggregate::AttributeSetFilter;
-use super::ComputeAggregation;
-use super::Measure;
+use super::{BoundMeasure, ComputeAggregation, Measure};
 use super::ValueMap;
 use super::{Aggregator, Number};
 
@@ -235,6 +236,15 @@ where
         self.filter.apply(attrs, |filtered| {
             self.value_map.measure((measurement, index), filtered);
         })
+    }
+
+    fn bind(
+        &self,
+        _attrs: &[KeyValue],
+        _self_arc: Arc<dyn Measure<T>>,
+    ) -> Box<dyn BoundMeasure<T>> {
+        // Will be implemented in Task 3
+        unimplemented!("bind() for Histogram — pending Task 3")
     }
 }
 

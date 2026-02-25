@@ -15,9 +15,21 @@ use super::{
     precomputed_sum::PrecomputedSum, sum::Sum, Number,
 };
 
+/// A pre-bound measurement handle that skips attribute lookup.
+/// Created by `Measure::bind()`, holds a direct reference to the tracker.
+pub(crate) trait BoundMeasure<T>: Send + Sync + 'static {
+    fn call(&self, measurement: T);
+}
+
 /// Receives measurements to be aggregated.
 pub(crate) trait Measure<T>: Send + Sync + 'static {
     fn call(&self, measurement: T, attrs: &[KeyValue]);
+
+    /// Create a pre-bound handle for the given attributes.
+    /// The `self_arc` parameter provides the Arc<dyn Measure<T>> for fallback
+    /// after poisoning (since &self cannot produce an Arc<Self>).
+    fn bind(&self, attrs: &[KeyValue], self_arc: Arc<dyn Measure<T>>)
+        -> Box<dyn BoundMeasure<T>>;
 }
 
 /// Stores the aggregate of measurements into the aggregation and returns the number
@@ -95,7 +107,7 @@ type Filter = Arc<dyn Fn(&KeyValue) -> bool + Send + Sync>;
 /// No-op, if filter is not set
 #[derive(Clone)]
 pub(crate) struct AttributeSetFilter {
-    filter: Option<Filter>,
+    pub(crate) filter: Option<Filter>,
 }
 
 impl AttributeSetFilter {
