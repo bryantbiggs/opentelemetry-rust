@@ -141,9 +141,13 @@ pub(crate) trait Aggregator {
 /// The `has_been_updated` flag tracks whether the tracker has received measurements
 /// since the last collection, enabling in-place iteration during delta collect
 /// instead of draining the entire map.
-struct TrackerEntry<A> {
-    aggregator: A,
-    has_been_updated: AtomicBool,
+pub(crate) struct TrackerEntry<A> {
+    pub(crate) aggregator: A,
+    pub(crate) has_been_updated: AtomicBool,
+    /// Set to `true` when this entry is evicted from the map during delta collect.
+    /// Bound instrument handles check this flag to detect staleness and fall back
+    /// to the unbound path.
+    pub(crate) evicted: AtomicBool,
 }
 
 impl<A: Aggregator> TrackerEntry<A> {
@@ -151,16 +155,17 @@ impl<A: Aggregator> TrackerEntry<A> {
         TrackerEntry {
             aggregator,
             has_been_updated: AtomicBool::new(true),
+            evicted: AtomicBool::new(false),
         }
     }
 }
 
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 /// Number of shards — must be a power of two for fast modulo via bitmask.
 const NUM_SHARDS: usize = 16;
 
-type ShardHashMap<A> = HashMap<HashedAttributes, TrackerEntry<A>, PassthroughBuildHasher>;
+type ShardHashMap<A> = HashMap<HashedAttributes, Arc<TrackerEntry<A>>, PassthroughBuildHasher>;
 
 /// A sharded concurrent map for attribute-to-tracker lookup.
 /// Each shard is independently locked, reducing contention on measure() from
@@ -210,7 +215,7 @@ impl<A: Aggregator> ShardedMap<A> {
 
         // Not found — check cardinality limit before inserting
         if count.load(Ordering::SeqCst) < cardinality_limit {
-            let new_entry = TrackerEntry::new(A::create(config));
+            let new_entry = Arc::new(TrackerEntry::new(A::create(config)));
             new_entry.aggregator.update(value);
             shard.insert(hashed_attrs.clone(), new_entry);
             count.fetch_add(1, Ordering::SeqCst);
@@ -230,7 +235,7 @@ impl<A: Aggregator> ShardedMap<A> {
             entry.aggregator.update(value);
             entry.has_been_updated.store(true, Ordering::Relaxed);
         } else {
-            let entry = TrackerEntry::new(A::create(config));
+            let entry = Arc::new(TrackerEntry::new(A::create(config)));
             entry.aggregator.update(value);
             overflow_shard.insert(overflow_attrs.clone(), entry);
         }
@@ -240,7 +245,7 @@ impl<A: Aggregator> ShardedMap<A> {
     /// Locks one shard at a time to minimize contention with measure().
     fn for_each<F>(&self, mut f: F)
     where
-        F: FnMut(&HashedAttributes, &TrackerEntry<A>),
+        F: FnMut(&HashedAttributes, &Arc<TrackerEntry<A>>),
     {
         for shard in self.shards.iter() {
             let shard = shard.lock().unwrap_or_else(|e| e.into_inner());
@@ -254,7 +259,7 @@ impl<A: Aggregator> ShardedMap<A> {
     /// Used for stale entry eviction in delta collect.
     fn retain<F>(&self, mut f: F)
     where
-        F: FnMut(&HashedAttributes, &TrackerEntry<A>) -> bool,
+        F: FnMut(&HashedAttributes, &Arc<TrackerEntry<A>>) -> bool,
     {
         for shard in self.shards.iter() {
             let mut shard = shard.lock().unwrap_or_else(|e| e.into_inner());
@@ -263,13 +268,54 @@ impl<A: Aggregator> ShardedMap<A> {
     }
 
     /// Drain all shards, returning all entries. Used by drain_and_reset.
-    fn drain_all(&self) -> Vec<(HashedAttributes, TrackerEntry<A>)> {
+    fn drain_all(&self) -> Vec<(HashedAttributes, Arc<TrackerEntry<A>>)> {
         let mut result = Vec::new();
         for shard in self.shards.iter() {
             let mut shard = shard.lock().unwrap_or_else(|e| e.into_inner());
             result.extend(shard.drain());
         }
         result
+    }
+
+    /// Resolve or create a tracker entry for the given attributes.
+    /// Returns an Arc clone that the caller can cache for direct access.
+    fn bind(
+        &self,
+        hashed_attrs: &HashedAttributes,
+        config: &A::InitConfig,
+        count: &AtomicUsize,
+        cardinality_limit: usize,
+        overflow_attrs: &HashedAttributes,
+    ) -> Arc<TrackerEntry<A>> {
+        let idx = Self::shard_index(hashed_attrs.hash);
+        let mut shard = self.shards[idx].lock().unwrap_or_else(|e| e.into_inner());
+
+        if let Some(entry) = shard.get(hashed_attrs) {
+            return Arc::clone(entry);
+        }
+
+        if count.load(Ordering::SeqCst) < cardinality_limit {
+            let new_entry = Arc::new(TrackerEntry::new(A::create(config)));
+            let cloned = Arc::clone(&new_entry);
+            shard.insert(hashed_attrs.clone(), new_entry);
+            count.fetch_add(1, Ordering::SeqCst);
+            return cloned;
+        }
+
+        // Over cardinality limit — bind to overflow bucket
+        drop(shard);
+        let overflow_idx = Self::shard_index(overflow_attrs.hash);
+        let mut overflow_shard = self.shards[overflow_idx]
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Some(entry) = overflow_shard.get(overflow_attrs) {
+            Arc::clone(entry)
+        } else {
+            let entry = Arc::new(TrackerEntry::new(A::create(config)));
+            let cloned = Arc::clone(&entry);
+            overflow_shard.insert(overflow_attrs.clone(), entry);
+            cloned
+        }
     }
 }
 
@@ -311,6 +357,23 @@ where
             config,
             cardinality_limit,
         }
+    }
+
+    /// Resolve or create a tracker for the given attributes, returning a shared
+    /// reference that can be cached by bound instrument handles.
+    pub(crate) fn bind(&self, attributes: &[KeyValue]) -> Arc<TrackerEntry<A>> {
+        assert!(
+            !attributes.is_empty(),
+            "bind() with empty attributes is not supported; use measure() directly"
+        );
+        let hashed = HashedAttributes::from_raw(attributes);
+        self.trackers.bind(
+            &hashed,
+            &self.config,
+            &self.count,
+            self.cardinality_limit,
+            &self.overflow_attrs,
+        )
     }
 
     fn measure(&self, value: A::PreComputedValue, attributes: &[KeyValue]) {
@@ -397,6 +460,7 @@ where
                 {
                     true
                 } else {
+                    entry.evicted.store(true, Ordering::Release);
                     evicted += 1;
                     false
                 }
@@ -428,6 +492,8 @@ where
         self.count.store(0, Ordering::SeqCst);
 
         for (attrs, entry) in old_entries {
+            // Poison drained entries so any bound handles detect staleness
+            entry.evicted.store(true, Ordering::Release);
             dest.push(map_fn(attrs.attrs, entry.aggregator.clone_and_reset(&self.config)));
         }
     }
@@ -834,6 +900,53 @@ mod tests {
 
         assert!(f64::abs(15.5 - value) < 0.0001, "Incorrect first value");
         assert!(f64::abs(0.0 - value2) < 0.0001, "Incorrect second value");
+    }
+
+    #[test]
+    fn value_map_bind_returns_tracker() {
+        let vm = ValueMap::<Assign<i64>>::new((), 2000);
+        let attrs = [KeyValue::new("k", "v")];
+        let entry = vm.bind(&attrs);
+        entry.aggregator.update(42);
+        assert_eq!(entry.aggregator.value.get_value(), 42);
+    }
+
+    #[test]
+    fn value_map_bind_same_attrs_returns_same_entry() {
+        let vm = ValueMap::<Assign<i64>>::new((), 2000);
+        let attrs = [KeyValue::new("k", "v")];
+        let e1 = vm.bind(&attrs);
+        let e2 = vm.bind(&attrs);
+        e1.aggregator.update(10);
+        assert_eq!(e2.aggregator.value.get_value(), 10); // Same underlying tracker
+    }
+
+    #[test]
+    fn value_map_bind_unsorted_attrs_canonicalized() {
+        let vm = ValueMap::<Assign<i64>>::new((), 2000);
+        let e1 = vm.bind(&[KeyValue::new("z", "1"), KeyValue::new("a", "2")]);
+        let e2 = vm.bind(&[KeyValue::new("a", "2"), KeyValue::new("z", "1")]);
+        e1.aggregator.update(99);
+        assert_eq!(e2.aggregator.value.get_value(), 99);
+    }
+
+    #[test]
+    fn poisoning_sets_evicted_on_stale_entries() {
+        let vm = ValueMap::<Assign<i64>>::new((), 2000);
+        let attrs = [KeyValue::new("k", "v")];
+        let entry = vm.bind(&attrs);
+        assert!(!entry.evicted.load(Ordering::Acquire));
+
+        // First collect_and_reset: entry was updated at bind time (has_been_updated=true),
+        // so first collect sees it as updated and collects it.
+        let mut dest = Vec::new();
+        vm.collect_and_reset(&mut dest, |attrs, aggr| (attrs, aggr.value.get_value()));
+
+        // Second collect_and_reset: entry is stale (no writes since last collect)
+        let mut dest2 = Vec::new();
+        vm.collect_and_reset(&mut dest2, |attrs, aggr| (attrs, aggr.value.get_value()));
+        // Now entry should be evicted and poisoned
+        assert!(entry.evicted.load(Ordering::Acquire));
     }
 
     #[test]
