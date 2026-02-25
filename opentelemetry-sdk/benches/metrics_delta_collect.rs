@@ -505,6 +505,114 @@ fn bench_sequential_collects(c: &mut Criterion) {
     group.finish();
 }
 
+// ============================================================================
+// BENCHMARK GROUP 7: Isolated post-collect measure() (collect in setup)
+// This isolates the core improvement: on main, delta collect drains the map,
+// so all subsequent measure() calls hit the write-lock insertion path. On the
+// optimized branch, the map is preserved, so measure() stays on the read-lock
+// fast path. By moving collect() to setup, we measure ONLY the measure() cost.
+// ============================================================================
+fn bench_measure_after_collect_isolated(c: &mut Criterion) {
+    let mut group = c.benchmark_group("MeasureAfterCollectIsolated");
+    group.warm_up_time(Duration::from_secs(1));
+    group.measurement_time(Duration::from_secs(3));
+
+    for temporality in [Temporality::Cumulative, Temporality::Delta] {
+        let label = match temporality {
+            Temporality::Delta => "Delta",
+            _ => "Cumulative",
+        };
+
+        let (rdr, counter) = setup_counter(temporality);
+        let mut rm = ResourceMetrics::default();
+        hydrate_counter(&counter);
+
+        group.throughput(Throughput::Elements(1000));
+        group.bench_function(BenchmarkId::new("Counter_1000ts", label), |b| {
+            b.iter_batched(
+                || {
+                    let _ = rdr.collect(&mut rm);
+                },
+                |_| {
+                    for a in 0..10 {
+                        for b_idx in 0..10 {
+                            for c_idx in 0..10 {
+                                counter.add(
+                                    1,
+                                    &[
+                                        KeyValue::new("attr1", ATTRIBUTE_VALUES[a]),
+                                        KeyValue::new("attr2", ATTRIBUTE_VALUES[b_idx]),
+                                        KeyValue::new("attr3", ATTRIBUTE_VALUES[c_idx]),
+                                    ],
+                                );
+                            }
+                        }
+                    }
+                },
+                BatchSize::LargeInput,
+            );
+        });
+    }
+    group.finish();
+}
+
+// ============================================================================
+// BENCHMARK GROUP 8: Multi-threaded post-collect measure() (collect in setup)
+// This is where write-lock contention manifests most clearly. On main, after
+// delta collect drains the map, all worker threads compete for the write lock
+// to re-insert entries. On the optimized branch, all threads use concurrent
+// read locks with no contention.
+// ============================================================================
+fn bench_multithread_measure_after_collect(c: &mut Criterion) {
+    let mut group = c.benchmark_group("MultithreadMeasureAfterCollect");
+    group.warm_up_time(Duration::from_secs(1));
+    group.measurement_time(Duration::from_secs(5));
+    group.sample_size(20);
+
+    let num_worker_threads = 4;
+    let measures_per_worker = 2500;
+
+    for temporality in [Temporality::Cumulative, Temporality::Delta] {
+        let label = match temporality {
+            Temporality::Delta => "Delta",
+            _ => "Cumulative",
+        };
+
+        let (rdr, counter) = setup_counter(temporality);
+        let mut rm = ResourceMetrics::default();
+        hydrate_counter(&counter);
+
+        group.throughput(Throughput::Elements(
+            (num_worker_threads * measures_per_worker) as u64,
+        ));
+        group.bench_function(
+            BenchmarkId::new(format!("{num_worker_threads}threads_counter"), label),
+            |b| {
+                b.iter_batched(
+                    || {
+                        let _ = rdr.collect(&mut rm);
+                    },
+                    |_| {
+                        std::thread::scope(|s| {
+                            for _ in 0..num_worker_threads {
+                                let counter_ref = &counter;
+                                s.spawn(move || {
+                                    for _ in 0..measures_per_worker {
+                                        let attrs = random_attrs_3();
+                                        counter_ref.add(1, &attrs);
+                                    }
+                                });
+                            }
+                        });
+                    },
+                    BatchSize::LargeInput,
+                );
+            },
+        );
+    }
+    group.finish();
+}
+
 criterion_group! {
     name = delta_collect_benches;
     config = Criterion::default();
@@ -514,7 +622,9 @@ criterion_group! {
         bench_collect_latency,
         bench_mixed_workload,
         bench_multithread_with_collect,
-        bench_sequential_collects
+        bench_sequential_collects,
+        bench_measure_after_collect_isolated,
+        bench_multithread_measure_after_collect
 }
 
 criterion_main!(delta_collect_benches);
