@@ -8,10 +8,11 @@ use crate::metrics::Temporality;
 use opentelemetry::KeyValue;
 
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 
 use super::aggregate::AggregateTimeInitiator;
 use super::aggregate::AttributeSetFilter;
-use super::{BoundMeasure, ComputeAggregation, Measure};
+use super::{BoundMeasure, ComputeAggregation, Measure, TrackerEntry};
 use super::ValueMap;
 use super::{Aggregator, Number};
 
@@ -220,6 +221,26 @@ impl<T: Number> Histogram<T> {
     }
 }
 
+struct BoundHistogramHandle<T: Number> {
+    entry: Arc<TrackerEntry<Mutex<Buckets<T>>>>,
+    bounds: Vec<f64>,
+    fallback: Arc<dyn Measure<T>>,
+    attrs: Vec<KeyValue>,
+}
+
+impl<T: Number> BoundMeasure<T> for BoundHistogramHandle<T> {
+    fn call(&self, value: T) {
+        if self.entry.evicted.load(Ordering::Acquire) {
+            self.fallback.call(value, &self.attrs);
+            return;
+        }
+        let f = value.into_float();
+        let index = self.bounds.partition_point(|&x| x < f);
+        self.entry.aggregator.update((value, index));
+        self.entry.has_been_updated.store(true, Ordering::Relaxed);
+    }
+}
+
 impl<T> Measure<T> for Histogram<T>
 where
     T: Number,
@@ -240,11 +261,20 @@ where
 
     fn bind(
         &self,
-        _attrs: &[KeyValue],
-        _self_arc: Arc<dyn Measure<T>>,
+        attrs: &[KeyValue],
+        self_arc: Arc<dyn Measure<T>>,
     ) -> Box<dyn BoundMeasure<T>> {
-        // Will be implemented in Task 3
-        unimplemented!("bind() for Histogram — pending Task 3")
+        let filtered: Vec<KeyValue> = match &self.filter.filter {
+            Some(filter) => attrs.iter().filter(|kv| filter(kv)).cloned().collect(),
+            None => attrs.to_vec(),
+        };
+        let entry = self.value_map.bind(&filtered);
+        Box::new(BoundHistogramHandle {
+            entry,
+            bounds: self.bounds.clone(),
+            fallback: self_arc,
+            attrs: filtered,
+        })
     }
 }
 
