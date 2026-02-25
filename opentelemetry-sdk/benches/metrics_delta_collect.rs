@@ -885,6 +885,106 @@ fn bench_write_contention(c: &mut Criterion) {
     group.finish();
 }
 
+// ============================================================================
+// BENCHMARK GROUP 13: Bound instruments (skip attribute lookup entirely)
+// Compares bound vs unbound measure() latency. Bound instruments cache a
+// direct reference to the underlying aggregator tracker, skipping the
+// sort→hash→lock→lookup path on every call.
+// ============================================================================
+fn bench_bound_instruments(c: &mut Criterion) {
+    let mut group = c.benchmark_group("BoundInstruments");
+    group.warm_up_time(Duration::from_secs(1));
+    group.measurement_time(Duration::from_secs(3));
+
+    // --- Bound Counter vs Unbound Counter (Delta) ---
+    {
+        let (_, counter) = setup_counter(Temporality::Delta);
+        hydrate_counter(&counter);
+
+        // Unbound baseline
+        group.bench_function("Counter_Unbound_Delta", |b| {
+            b.iter_batched(
+                random_attrs_3,
+                |attrs| counter.add(1, &attrs),
+                BatchSize::SmallInput,
+            );
+        });
+
+        // Bound: pre-bind a single attribute set
+        let bound = counter.bind(&[
+            KeyValue::new("attr1", "value1"),
+            KeyValue::new("attr2", "value2"),
+            KeyValue::new("attr3", "value3"),
+        ]);
+        group.bench_function("Counter_Bound_Delta", |b| {
+            b.iter(|| bound.add(1));
+        });
+    }
+
+    // --- Bound Histogram vs Unbound Histogram (Delta) ---
+    {
+        let (_, histogram) = setup_histogram(Temporality::Delta);
+        hydrate_histogram(&histogram);
+
+        group.bench_function("Histogram_Unbound_Delta", |b| {
+            b.iter_batched(
+                random_attrs_3,
+                |attrs| histogram.record(42, &attrs),
+                BatchSize::SmallInput,
+            );
+        });
+
+        let bound_hist = histogram.bind(&[
+            KeyValue::new("attr1", "value1"),
+            KeyValue::new("attr2", "value2"),
+            KeyValue::new("attr3", "value3"),
+        ]);
+        group.bench_function("Histogram_Bound_Delta", |b| {
+            b.iter(|| bound_hist.record(42));
+        });
+    }
+
+    // --- Multi-threaded bound counter ---
+    for num_threads in [2, 4, 8] {
+        let (_, counter) = setup_counter(Temporality::Delta);
+        hydrate_counter(&counter);
+
+        // Each thread gets its own bound handle to the same attribute set
+        group.bench_function(
+            BenchmarkId::new("Counter_Bound_Multithread", num_threads),
+            |b| {
+                b.iter_custom(|iters| {
+                    let barrier = Arc::new(Barrier::new(num_threads));
+                    let handles: Vec<_> = (0..num_threads)
+                        .map(|_| {
+                            let bound = counter.bind(&[
+                                KeyValue::new("attr1", "value1"),
+                                KeyValue::new("attr2", "value2"),
+                                KeyValue::new("attr3", "value3"),
+                            ]);
+                            let barrier = barrier.clone();
+                            std::thread::spawn(move || {
+                                barrier.wait();
+                                let start = std::time::Instant::now();
+                                for _ in 0..iters {
+                                    bound.add(1);
+                                }
+                                start.elapsed()
+                            })
+                        })
+                        .collect();
+
+                    let total: Duration =
+                        handles.into_iter().map(|h| h.join().unwrap()).sum();
+                    total / num_threads as u32
+                });
+            },
+        );
+    }
+
+    group.finish();
+}
+
 criterion_group! {
     name = delta_collect_benches;
     config = Criterion::default();
@@ -900,7 +1000,8 @@ criterion_group! {
         bench_collect_only,
         bench_collect_heavy_workload,
         bench_multithread_measure_during_collect,
-        bench_write_contention
+        bench_write_contention,
+        bench_bound_instruments
 }
 
 criterion_main!(delta_collect_benches);
