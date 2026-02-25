@@ -101,6 +101,10 @@ impl<A> ValueMap<A>
 where
     A: Aggregator,
 {
+    pub(crate) fn config(&self) -> &A::InitConfig {
+        &self.config
+    }
+
     fn new(config: A::InitConfig, cardinality_limit: usize) -> Self {
         ValueMap {
             trackers: RwLock::new(HashMap::with_capacity(
@@ -254,10 +258,8 @@ where
     }
 
     /// Iterate through all attribute sets, populate `DataPoints` and reset by draining the map.
-    /// This is used for:
-    /// - Asynchronous instruments (Observable/PrecomputedSum) in both Delta and Cumulative
-    ///   temporality modes, where map clearing is needed for staleness detection
-    /// - Histogram and ExponentialHistogram in Delta temporality mode (until migrated)
+    /// This is used for asynchronous instruments (Observable/PrecomputedSum) in both Delta and
+    /// Cumulative temporality modes, where map clearing is needed for staleness detection.
     pub(crate) fn drain_and_reset<Res, MapFn>(&self, dest: &mut Vec<Res>, mut map_fn: MapFn)
     where
         MapFn: FnMut(Vec<KeyValue>, A) -> Res,
