@@ -120,6 +120,11 @@ harness = false
 required-features = ["metrics", "spec_unstable_metrics_views", "experimental_metrics_custom_reader"]
 
 [[bench]]
+name = "metrics_delta_collect"
+harness = false
+required-features = ["metrics", "experimental_metrics_custom_reader"]
+
+[[bench]]
 name = "log"
 harness = false
 required-features = ["logs"]
