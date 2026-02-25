@@ -217,14 +217,48 @@ where
         }
     }
 
-    /// Iterate through all attribute sets, populate `DataPoints` and reset.
-    /// This is used for:
-    /// - Synchronous instruments in Delta temporality mode
-    /// - Asynchronous instruments (Observable) in both Delta and Cumulative temporality modes
+    /// Iterate through all attribute sets in-place, populate `DataPoints` and reset.
+    /// Unlike `drain_and_reset`, this keeps entries in the map and only processes
+    /// those that have been updated since the last collection (tracked via the
+    /// `has_been_updated` flag in TrackerEntry). This avoids the write lock,
+    /// heap allocations, and map rebuilding that occurs with drain-based collection.
     ///
-    /// For asynchronous instruments, this removes stale attribute sets that were not observed
-    /// in the current callback, ensuring only currently active attributes are reported.
+    /// Used for synchronous instruments (Counter, Gauge) in Delta temporality mode.
     pub(crate) fn collect_and_reset<Res, MapFn>(&self, dest: &mut Vec<Res>, mut map_fn: MapFn)
+    where
+        MapFn: FnMut(Vec<KeyValue>, &A) -> Res,
+    {
+        prepare_data(dest, self.count.load(Ordering::SeqCst));
+        if self.has_no_attribute_value.load(Ordering::Acquire) {
+            if self
+                .no_attribute_tracker
+                .has_been_updated
+                .swap(false, Ordering::AcqRel)
+            {
+                dest.push(map_fn(vec![], &self.no_attribute_tracker.aggregator));
+            }
+        }
+
+        let Ok(trackers) = self.trackers.read() else {
+            return;
+        };
+
+        let mut seen = HashSet::new();
+        for (attrs, tracker) in trackers.iter() {
+            if seen.insert(Arc::as_ptr(tracker)) {
+                if tracker.has_been_updated.swap(false, Ordering::AcqRel) {
+                    dest.push(map_fn(attrs.clone(), &tracker.aggregator));
+                }
+            }
+        }
+    }
+
+    /// Iterate through all attribute sets, populate `DataPoints` and reset by draining the map.
+    /// This is used for:
+    /// - Asynchronous instruments (Observable/PrecomputedSum) in both Delta and Cumulative
+    ///   temporality modes, where map clearing is needed for staleness detection
+    /// - Histogram and ExponentialHistogram in Delta temporality mode (until migrated)
+    pub(crate) fn drain_and_reset<Res, MapFn>(&self, dest: &mut Vec<Res>, mut map_fn: MapFn)
     where
         MapFn: FnMut(Vec<KeyValue>, A) -> Res,
     {

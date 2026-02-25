@@ -134,7 +134,7 @@ impl<T: Number> Histogram<T> {
         h.time = time.current;
 
         self.value_map
-            .collect_and_reset(&mut h.data_points, |attributes, aggr| {
+            .drain_and_reset(&mut h.data_points, |attributes, aggr| {
                 let b = aggr.into_inner().unwrap_or_else(|err| err.into_inner());
                 HistogramDataPoint {
                     attributes,

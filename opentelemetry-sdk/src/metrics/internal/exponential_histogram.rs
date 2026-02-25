@@ -413,7 +413,7 @@ impl<T: Number> ExpoHistogram<T> {
         h.time = time.current;
 
         self.value_map
-            .collect_and_reset(&mut h.data_points, |attributes, attr| {
+            .drain_and_reset(&mut h.data_points, |attributes, attr| {
                 let b = attr.into_inner().unwrap_or_else(|err| err.into_inner());
                 data::ExponentialHistogramDataPoint {
                     attributes,
