@@ -10,8 +10,7 @@ use core::fmt;
 use portable_atomic::{AtomicI64, AtomicU64};
 use std::cmp::min;
 use std::collections::{HashMap, HashSet};
-use std::mem::swap;
-use std::ops::{Add, AddAssign, DerefMut, Sub};
+use std::ops::{Add, AddAssign, Sub};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 #[cfg(target_has_atomic = "64")]
 use std::sync::atomic::{AtomicI64, AtomicU64};
@@ -81,11 +80,6 @@ where
     /// Trackers store the values associated with different attribute sets.
     trackers: RwLock<HashMap<Vec<KeyValue>, Arc<TrackerEntry<A>>>>,
 
-    /// Used ONLY by Delta collect. The data type must match the one used in
-    /// `trackers` to allow mem::swap. Wrapping the type in `OnceLock` to
-    /// avoid this allocation for Cumulative aggregation.
-    trackers_for_collect: OnceLock<RwLock<HashMap<Vec<KeyValue>, Arc<TrackerEntry<A>>>>>,
-
     /// Number of different attribute set stored in the `trackers` map.
     count: AtomicUsize,
     /// Indicates whether a value with no attributes has been stored.
@@ -110,22 +104,12 @@ where
             trackers: RwLock::new(HashMap::with_capacity(
                 1 + min(DEFAULT_CARDINALITY_LIMIT, cardinality_limit),
             )),
-            trackers_for_collect: OnceLock::new(),
             has_no_attribute_value: AtomicBool::new(false),
             no_attribute_tracker: TrackerEntry::new(A::create(&config)),
             count: AtomicUsize::new(0),
             config,
             cardinality_limit,
         }
-    }
-
-    #[inline]
-    fn trackers_for_collect(&self) -> &RwLock<HashMap<Vec<KeyValue>, Arc<TrackerEntry<A>>>> {
-        self.trackers_for_collect.get_or_init(|| {
-            RwLock::new(HashMap::with_capacity(
-                1 + min(DEFAULT_CARDINALITY_LIMIT, self.cardinality_limit),
-            ))
-        })
     }
 
     /// Checks whether aggregator has hit cardinality limit for metric streams
@@ -274,23 +258,21 @@ where
             ));
         }
 
-        if let Ok(mut trackers_collect) = self.trackers_for_collect().write() {
-            if let Ok(mut trackers_current) = self.trackers.write() {
-                swap(trackers_collect.deref_mut(), trackers_current.deref_mut());
-                self.count.store(0, Ordering::SeqCst);
-            } else {
+        let old_trackers = {
+            let Ok(mut trackers) = self.trackers.write() else {
                 otel_warn!(name: "MeterProvider.InternalError", message = "Metric collection failed. Report this issue in OpenTelemetry repo.", details ="ValueMap trackers lock poisoned");
                 return;
-            }
+            };
+            self.count.store(0, Ordering::SeqCst);
+            std::mem::take(&mut *trackers)
+            // Write lock released here
+        };
 
-            let mut seen = HashSet::new();
-            for (attrs, tracker) in trackers_collect.drain() {
-                if seen.insert(Arc::as_ptr(&tracker)) {
-                    dest.push(map_fn(attrs, tracker.aggregator.clone_and_reset(&self.config)));
-                }
+        let mut seen = HashSet::new();
+        for (attrs, tracker) in old_trackers {
+            if seen.insert(Arc::as_ptr(&tracker)) {
+                dest.push(map_fn(attrs, tracker.aggregator.clone_and_reset(&self.config)));
             }
-        } else {
-            otel_warn!(name: "MeterProvider.InternalError", message = "Metric collection failed. Report this issue in OpenTelemetry repo.", details ="ValueMap trackers for collect lock poisoned");
         }
     }
 }
@@ -714,8 +696,6 @@ mod tests {
         // This is a regression test for panics that used to occur for large cardinality limits
 
         // Should not panic
-        let value_map = ValueMap::<Assign<i64>>::new((), usize::MAX);
-        // Should not panic
-        let _ = value_map.trackers_for_collect();
+        let _value_map = ValueMap::<Assign<i64>>::new((), usize::MAX);
     }
 }
