@@ -2,7 +2,7 @@ use crate::KeyValue;
 use core::fmt;
 use std::sync::Arc;
 
-use super::SyncInstrument;
+use super::{BoundSyncInstrument, SyncInstrument};
 
 /// An instrument that records a distribution of values.
 ///
@@ -31,5 +31,34 @@ impl<T> Histogram<T> {
     /// Adds an additional value to the distribution.
     pub fn record(&self, value: T, attributes: &[KeyValue]) {
         self.0.measure(value, attributes)
+    }
+
+    /// Create a pre-bound histogram handle for the given attribute set.
+    ///
+    /// The returned [`BoundHistogram`] caches a direct reference to the underlying
+    /// aggregator, bypassing per-call attribute sort, hash, and lookup.
+    pub fn bind(&self, attributes: &[KeyValue]) -> BoundHistogram<T> {
+        BoundHistogram(self.0.bind(attributes))
+    }
+}
+
+/// A pre-bound histogram handle that records values without per-call attribute lookup.
+///
+/// Created by [`Histogram::bind`]. Holds a cached reference to the underlying aggregator.
+pub struct BoundHistogram<T>(Box<dyn BoundSyncInstrument<T>>);
+
+impl<T> fmt::Debug for BoundHistogram<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_fmt(format_args!(
+            "BoundHistogram<{}>",
+            std::any::type_name::<T>()
+        ))
+    }
+}
+
+impl<T> BoundHistogram<T> {
+    /// Records a value using the pre-bound attributes.
+    pub fn record(&self, value: T) {
+        self.0.measure(value)
     }
 }

@@ -2,7 +2,7 @@ use crate::KeyValue;
 use core::fmt;
 use std::sync::Arc;
 
-use super::SyncInstrument;
+use super::{BoundSyncInstrument, SyncInstrument};
 
 /// An instrument that records increasing values.
 ///
@@ -31,6 +31,37 @@ impl<T> Counter<T> {
     /// Records an increment to the counter.
     pub fn add(&self, value: T, attributes: &[KeyValue]) {
         self.0.measure(value, attributes)
+    }
+
+    /// Create a pre-bound counter handle for the given attribute set.
+    ///
+    /// The returned [`BoundCounter`] caches a direct reference to the underlying
+    /// aggregator, bypassing per-call attribute sort, hash, and lookup.
+    /// This is significantly faster for hot paths that always record with
+    /// the same attributes.
+    pub fn bind(&self, attributes: &[KeyValue]) -> BoundCounter<T> {
+        BoundCounter(self.0.bind(attributes))
+    }
+}
+
+/// A pre-bound counter handle that records increments without per-call attribute lookup.
+///
+/// Created by [`Counter::bind`]. Holds a cached reference to the underlying aggregator.
+pub struct BoundCounter<T>(Box<dyn BoundSyncInstrument<T>>);
+
+impl<T> fmt::Debug for BoundCounter<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_fmt(format_args!(
+            "BoundCounter<{}>",
+            std::any::type_name::<T>()
+        ))
+    }
+}
+
+impl<T> BoundCounter<T> {
+    /// Records an increment using the pre-bound attributes.
+    pub fn add(&self, value: T) {
+        self.0.measure(value)
     }
 }
 
