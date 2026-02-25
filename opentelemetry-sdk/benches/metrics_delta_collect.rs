@@ -72,6 +72,19 @@ fn random_attrs_3() -> [KeyValue; 3] {
     })
 }
 
+/// Generate deterministic attributes from a flat index (0..999 -> 3-attr combination).
+/// Avoids RNG overhead in timed sections.
+fn deterministic_attrs(index: usize) -> [KeyValue; 3] {
+    let a = index / 100;
+    let b = (index / 10) % 10;
+    let c = index % 10;
+    [
+        KeyValue::new("attr1", ATTRIBUTE_VALUES[a]),
+        KeyValue::new("attr2", ATTRIBUTE_VALUES[b]),
+        KeyValue::new("attr3", ATTRIBUTE_VALUES[c]),
+    ]
+}
+
 fn setup_counter(temporality: Temporality) -> (SharedReader, Counter<u64>) {
     let rdr = SharedReader(Arc::new(
         ManualReader::builder()
@@ -133,6 +146,15 @@ fn hydrate_histogram(histogram: &Histogram<u64>) {
                 );
             }
         }
+    }
+}
+
+/// Hydrate a counter with exactly `cardinality` distinct time series.
+/// Uses deterministic_attrs(0..cardinality).
+fn hydrate_counter_n(counter: &Counter<u64>, cardinality: usize) {
+    for i in 0..cardinality {
+        let attrs = deterministic_attrs(i);
+        counter.add(1, &attrs);
     }
 }
 
@@ -616,6 +638,253 @@ fn bench_multithread_measure_after_collect(c: &mut Criterion) {
     group.finish();
 }
 
+// ============================================================================
+// BENCHMARK GROUP 9: Pure collect() cost -- no measure() in timed section
+// Isolates the collect path completely. Hashing/lookup cost is irrelevant here.
+// Setup hydrates the map with data; timed section is ONLY the rdr.collect()
+// call. For delta, each collect resets update flags (optimized branch) or drains
+// the map (main). Between iterations we re-hydrate in setup so there is always
+// data to collect.
+// ============================================================================
+fn bench_collect_only(c: &mut Criterion) {
+    let mut group = c.benchmark_group("CollectOnly");
+    group.warm_up_time(Duration::from_secs(1));
+    group.measurement_time(Duration::from_secs(3));
+
+    for cardinality in [100, 1000] {
+        for temporality in [Temporality::Cumulative, Temporality::Delta] {
+            let label = match temporality {
+                Temporality::Delta => "Delta",
+                _ => "Cumulative",
+            };
+
+            let (rdr, counter) = setup_counter(temporality);
+            // Pre-warm: hydrate and collect once to pre-allocate ResourceMetrics internals
+            hydrate_counter_n(&counter, cardinality);
+            let mut rm = ResourceMetrics::default();
+            let _ = rdr.collect(&mut rm);
+
+            group.throughput(Throughput::Elements(cardinality as u64));
+            group.bench_function(
+                BenchmarkId::new(format!("Counter_{cardinality}ts"), label),
+                |b| {
+                    b.iter_batched(
+                        || {
+                            // Setup: re-hydrate so there is data to collect
+                            hydrate_counter_n(&counter, cardinality);
+                        },
+                        |_| {
+                            // Timed: ONLY the collect call
+                            let _ = rdr.collect(&mut rm);
+                        },
+                        BatchSize::PerIteration,
+                    );
+                },
+            );
+        }
+    }
+    group.finish();
+}
+
+// ============================================================================
+// BENCHMARK GROUP 10: Collect-heavy workload -- low measure-to-collect ratios
+// At 1000:1 ratio, collect is <0.1% of CPU and invisible. These ratios make
+// collect cost a significant fraction of total time so improvements are visible.
+// Uses deterministic attribute iteration to eliminate RNG overhead from the
+// timed section.
+// ============================================================================
+fn bench_collect_heavy_workload(c: &mut Criterion) {
+    let mut group = c.benchmark_group("CollectHeavyWorkload");
+    group.warm_up_time(Duration::from_secs(1));
+    group.measurement_time(Duration::from_secs(3));
+
+    let cardinality = 1000;
+
+    for ratio in [1, 10, 100] {
+        for temporality in [Temporality::Cumulative, Temporality::Delta] {
+            let label = match temporality {
+                Temporality::Delta => "Delta",
+                _ => "Cumulative",
+            };
+
+            let (rdr, counter) = setup_counter(temporality);
+            let mut rm = ResourceMetrics::default();
+            hydrate_counter_n(&counter, cardinality);
+            // Warm collect so ResourceMetrics is pre-allocated
+            let _ = rdr.collect(&mut rm);
+
+            group.throughput(Throughput::Elements(ratio as u64));
+            group.bench_function(
+                BenchmarkId::new(format!("{ratio}measure_1collect"), label),
+                |b| {
+                    b.iter(|| {
+                        // Deterministic measures: cycle through attribute combos
+                        for i in 0..ratio {
+                            let attrs = deterministic_attrs(i % cardinality);
+                            counter.add(1, &attrs);
+                        }
+                        let _ = rdr.collect(&mut rm);
+                    });
+                },
+            );
+        }
+    }
+    group.finish();
+}
+
+// ============================================================================
+// BENCHMARK GROUP 11: Multi-thread measure() throughput during concurrent collect()
+// N worker threads each do a fixed number of measure() calls while a collector
+// thread continuously calls collect(). Criterion measures total wall time for
+// all workers to complete their work. The collector thread creates contention:
+// on main, delta collect drains the map, forcing all workers onto the write-lock
+// re-insertion path; on the optimized branch, workers stay on the read-lock path.
+// Uses barrier synchronization so all threads start simultaneously.
+// ============================================================================
+fn bench_multithread_measure_during_collect(c: &mut Criterion) {
+    let mut group = c.benchmark_group("MultithreadMeasureDuringCollect");
+    group.warm_up_time(Duration::from_secs(1));
+    group.measurement_time(Duration::from_secs(5));
+    group.sample_size(20);
+
+    let measures_per_worker = 5000;
+
+    for num_threads in [2, 4, 8] {
+        let total_measures = (num_threads * measures_per_worker) as u64;
+
+        for temporality in [Temporality::Cumulative, Temporality::Delta] {
+            let label = match temporality {
+                Temporality::Delta => "Delta",
+                _ => "Cumulative",
+            };
+
+            let (rdr, counter) = setup_counter(temporality);
+            hydrate_counter(&counter);
+
+            group.throughput(Throughput::Elements(total_measures));
+            group.bench_function(
+                BenchmarkId::new(format!("{num_threads}threads"), label),
+                |b| {
+                    b.iter(|| {
+                        let done = Arc::new(AtomicBool::new(false));
+                        // +1 for the collector thread
+                        let barrier = Arc::new(Barrier::new(num_threads + 1));
+
+                        std::thread::scope(|s| {
+                            // Collector thread: collect repeatedly until workers finish
+                            let rdr_ref = &rdr;
+                            let done_ref = done.clone();
+                            let barrier_ref = barrier.clone();
+                            s.spawn(move || {
+                                let mut rm = ResourceMetrics::default();
+                                barrier_ref.wait();
+                                while !done_ref.load(Ordering::Relaxed) {
+                                    let _ = rdr_ref.collect(&mut rm);
+                                    // Yield briefly so workers can make progress between collects
+                                    std::thread::yield_now();
+                                }
+                                // Final collect
+                                let _ = rdr_ref.collect(&mut rm);
+                            });
+
+                            // Worker threads: each does a fixed number of measures
+                            for thread_id in 0..num_threads {
+                                let barrier_ref = barrier.clone();
+                                let done_ref = done.clone();
+                                let counter_ref = &counter;
+                                s.spawn(move || {
+                                    barrier_ref.wait();
+                                    let base = thread_id * measures_per_worker;
+                                    for i in 0..measures_per_worker {
+                                        let attrs = deterministic_attrs((base + i) % 1000);
+                                        counter_ref.add(1, &attrs);
+                                    }
+                                    // Last worker to finish signals the collector to stop.
+                                    // (Multiple stores are fine; all store true.)
+                                    done_ref.store(true, Ordering::Relaxed);
+                                });
+                            }
+                        });
+                    });
+                },
+            );
+        }
+    }
+    group.finish();
+}
+
+// ============================================================================
+// BENCHMARK GROUP 12: Write contention -- sharpest possible contention test
+// Setup: hydrate the map, then collect (on main this drains the map; on the
+// optimized branch it resets flags but keeps entries). Timed: N threads each do
+// a short burst of measure() calls simultaneously via barrier. This directly
+// measures the latency of measure() under maximal write-lock contention. If old
+// code drained the map, all threads fight for write lock to re-insert; if new
+// code kept entries, all threads use concurrent read locks.
+// ============================================================================
+fn bench_write_contention(c: &mut Criterion) {
+    let mut group = c.benchmark_group("WriteContention");
+    group.warm_up_time(Duration::from_secs(1));
+    group.measurement_time(Duration::from_secs(5));
+    group.sample_size(30);
+
+    let measures_per_thread = 100; // short burst to emphasize lock overhead
+
+    for num_threads in [2, 4, 8] {
+        for temporality in [Temporality::Cumulative, Temporality::Delta] {
+            let label = match temporality {
+                Temporality::Delta => "Delta",
+                _ => "Cumulative",
+            };
+
+            let (rdr, counter) = setup_counter(temporality);
+            let mut rm = ResourceMetrics::default();
+            hydrate_counter(&counter);
+
+            group.throughput(Throughput::Elements(
+                (num_threads * measures_per_thread) as u64,
+            ));
+            group.bench_function(
+                BenchmarkId::new(
+                    format!("{num_threads}threads_{measures_per_thread}each"),
+                    label,
+                ),
+                |b| {
+                    b.iter_batched(
+                        || {
+                            // Setup: re-hydrate, then collect (drains on main,
+                            // resets flags on optimized branch)
+                            hydrate_counter(&counter);
+                            let _ = rdr.collect(&mut rm);
+                        },
+                        |_| {
+                            // Timed: all threads burst simultaneously
+                            let barrier = Arc::new(Barrier::new(num_threads));
+                            std::thread::scope(|s| {
+                                for thread_id in 0..num_threads {
+                                    let barrier_ref = barrier.clone();
+                                    let counter_ref = &counter;
+                                    s.spawn(move || {
+                                        // Synchronize: all threads start at the same instant
+                                        barrier_ref.wait();
+                                        let base = thread_id * measures_per_thread;
+                                        for i in 0..measures_per_thread {
+                                            let attrs = deterministic_attrs((base + i) % 1000);
+                                            counter_ref.add(1, &attrs);
+                                        }
+                                    });
+                                }
+                            });
+                        },
+                        BatchSize::LargeInput,
+                    );
+                },
+            );
+        }
+    }
+    group.finish();
+}
+
 criterion_group! {
     name = delta_collect_benches;
     config = Criterion::default();
@@ -627,7 +896,11 @@ criterion_group! {
         bench_multithread_with_collect,
         bench_sequential_collects,
         bench_measure_after_collect_isolated,
-        bench_multithread_measure_after_collect
+        bench_multithread_measure_after_collect,
+        bench_collect_only,
+        bench_collect_heavy_workload,
+        bench_multithread_measure_during_collect,
+        bench_write_contention
 }
 
 criterion_main!(delta_collect_benches);
