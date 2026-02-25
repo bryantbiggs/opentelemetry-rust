@@ -721,7 +721,7 @@ mod tests {
             for v in test.values {
                 Measure::call(&h, v, &[]);
             }
-            let dp = h.value_map.no_attribute_tracker.lock().unwrap();
+            let dp = h.value_map.no_attribute_tracker.aggregator.lock().unwrap();
 
             assert_eq!(test.expected.max, dp.max);
             assert_eq!(test.expected.min, dp.min);
@@ -778,7 +778,7 @@ mod tests {
             for v in test.values {
                 Measure::call(&h, v, &[]);
             }
-            let dp = h.value_map.no_attribute_tracker.lock().unwrap();
+            let dp = h.value_map.no_attribute_tracker.aggregator.lock().unwrap();
 
             assert_eq!(test.expected.max, dp.max);
             assert_eq!(test.expected.min, dp.min);

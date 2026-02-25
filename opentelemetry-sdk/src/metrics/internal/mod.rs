@@ -52,6 +52,24 @@ pub(crate) trait Aggregator {
     fn clone_and_reset(&self, init: &Self::InitConfig) -> Self;
 }
 
+/// Wraps an aggregator with a status flag for delta collection optimization.
+/// The `has_been_updated` flag tracks whether the tracker has received measurements
+/// since the last collection, enabling in-place iteration during delta collect
+/// instead of draining the entire map.
+struct TrackerEntry<A> {
+    aggregator: A,
+    has_been_updated: AtomicBool,
+}
+
+impl<A: Aggregator> TrackerEntry<A> {
+    fn new(aggregator: A) -> Self {
+        TrackerEntry {
+            aggregator,
+            has_been_updated: AtomicBool::new(true),
+        }
+    }
+}
+
 /// The storage for sums.
 ///
 /// This structure is parametrized by an `Operation` that indicates how
@@ -61,19 +79,19 @@ where
     A: Aggregator,
 {
     /// Trackers store the values associated with different attribute sets.
-    trackers: RwLock<HashMap<Vec<KeyValue>, Arc<A>>>,
+    trackers: RwLock<HashMap<Vec<KeyValue>, Arc<TrackerEntry<A>>>>,
 
     /// Used ONLY by Delta collect. The data type must match the one used in
     /// `trackers` to allow mem::swap. Wrapping the type in `OnceLock` to
     /// avoid this allocation for Cumulative aggregation.
-    trackers_for_collect: OnceLock<RwLock<HashMap<Vec<KeyValue>, Arc<A>>>>,
+    trackers_for_collect: OnceLock<RwLock<HashMap<Vec<KeyValue>, Arc<TrackerEntry<A>>>>>,
 
     /// Number of different attribute set stored in the `trackers` map.
     count: AtomicUsize,
     /// Indicates whether a value with no attributes has been stored.
     has_no_attribute_value: AtomicBool,
     /// Tracker for values with no attributes attached.
-    no_attribute_tracker: A,
+    no_attribute_tracker: TrackerEntry<A>,
     /// Configuration for an Aggregator
     config: A::InitConfig,
     cardinality_limit: usize,
@@ -90,7 +108,7 @@ where
             )),
             trackers_for_collect: OnceLock::new(),
             has_no_attribute_value: AtomicBool::new(false),
-            no_attribute_tracker: A::create(&config),
+            no_attribute_tracker: TrackerEntry::new(A::create(&config)),
             count: AtomicUsize::new(0),
             config,
             cardinality_limit,
@@ -98,7 +116,7 @@ where
     }
 
     #[inline]
-    fn trackers_for_collect(&self) -> &RwLock<HashMap<Vec<KeyValue>, Arc<A>>> {
+    fn trackers_for_collect(&self) -> &RwLock<HashMap<Vec<KeyValue>, Arc<TrackerEntry<A>>>> {
         self.trackers_for_collect.get_or_init(|| {
             RwLock::new(HashMap::with_capacity(
                 1 + min(DEFAULT_CARDINALITY_LIMIT, self.cardinality_limit),
@@ -113,7 +131,10 @@ where
 
     fn measure(&self, value: A::PreComputedValue, attributes: &[KeyValue]) {
         if attributes.is_empty() {
-            self.no_attribute_tracker.update(value);
+            self.no_attribute_tracker.aggregator.update(value);
+            self.no_attribute_tracker
+                .has_been_updated
+                .store(true, Ordering::Release);
             self.has_no_attribute_value.store(true, Ordering::Release);
             return;
         }
@@ -124,14 +145,16 @@ where
 
         // Try to retrieve and update the tracker with the attributes in the provided order first
         if let Some(tracker) = trackers.get(attributes) {
-            tracker.update(value);
+            tracker.aggregator.update(value);
+            tracker.has_been_updated.store(true, Ordering::Release);
             return;
         }
 
         // Try to retrieve and update the tracker with the attributes sorted.
         let sorted_attrs = sort_and_dedup(attributes);
         if let Some(tracker) = trackers.get(sorted_attrs.as_slice()) {
-            tracker.update(value);
+            tracker.aggregator.update(value);
+            tracker.has_been_updated.store(true, Ordering::Release);
             return;
         }
 
@@ -145,12 +168,15 @@ where
         // Recheck both the provided and sorted orders after acquiring the write lock
         // in case another thread has pushed an update in the meantime.
         if let Some(tracker) = trackers.get(attributes) {
-            tracker.update(value);
+            tracker.aggregator.update(value);
+            tracker.has_been_updated.store(true, Ordering::Release);
         } else if let Some(tracker) = trackers.get(sorted_attrs.as_slice()) {
-            tracker.update(value);
+            tracker.aggregator.update(value);
+            tracker.has_been_updated.store(true, Ordering::Release);
         } else if self.is_under_cardinality_limit() {
-            let new_tracker = Arc::new(A::create(&self.config));
-            new_tracker.update(value);
+            let new_tracker = Arc::new(TrackerEntry::new(A::create(&self.config)));
+            new_tracker.aggregator.update(value);
+            new_tracker.has_been_updated.store(true, Ordering::Release);
 
             // Insert tracker with the attributes in the provided and sorted orders
             trackers.insert(attributes.to_vec(), new_tracker.clone());
@@ -158,10 +184,11 @@ where
 
             self.count.fetch_add(1, Ordering::SeqCst);
         } else if let Some(overflow_value) = trackers.get(stream_overflow_attributes().as_slice()) {
-            overflow_value.update(value);
+            overflow_value.aggregator.update(value);
+            overflow_value.has_been_updated.store(true, Ordering::Release);
         } else {
-            let new_tracker = A::create(&self.config);
-            new_tracker.update(value);
+            let new_tracker = TrackerEntry::new(A::create(&self.config));
+            new_tracker.aggregator.update(value);
             trackers.insert(stream_overflow_attributes().clone(), Arc::new(new_tracker));
         }
     }
@@ -175,7 +202,7 @@ where
     {
         prepare_data(dest, self.count.load(Ordering::SeqCst));
         if self.has_no_attribute_value.load(Ordering::Acquire) {
-            dest.push(map_fn(vec![], &self.no_attribute_tracker));
+            dest.push(map_fn(vec![], &self.no_attribute_tracker.aggregator));
         }
 
         let Ok(trackers) = self.trackers.read() else {
@@ -185,7 +212,7 @@ where
         let mut seen = HashSet::new();
         for (attrs, tracker) in trackers.iter() {
             if seen.insert(Arc::as_ptr(tracker)) {
-                dest.push(map_fn(attrs.clone(), tracker));
+                dest.push(map_fn(attrs.clone(), &tracker.aggregator));
             }
         }
     }
@@ -205,7 +232,9 @@ where
         if self.has_no_attribute_value.swap(false, Ordering::AcqRel) {
             dest.push(map_fn(
                 vec![],
-                self.no_attribute_tracker.clone_and_reset(&self.config),
+                self.no_attribute_tracker
+                    .aggregator
+                    .clone_and_reset(&self.config),
             ));
         }
 
@@ -221,7 +250,7 @@ where
             let mut seen = HashSet::new();
             for (attrs, tracker) in trackers_collect.drain() {
                 if seen.insert(Arc::as_ptr(&tracker)) {
-                    dest.push(map_fn(attrs, tracker.clone_and_reset(&self.config)));
+                    dest.push(map_fn(attrs, tracker.aggregator.clone_and_reset(&self.config)));
                 }
             }
         } else {
